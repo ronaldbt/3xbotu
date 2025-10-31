@@ -1,0 +1,13 @@
+#!/usr/bin/expect -f
+set timeout 300
+set password "0dmTuEBqJFru4r6IlqMWo3"
+
+spawn bash -c "cd /home/vlad/botu-3x && bash install-and-deploy.sh"
+expect {
+    "password" {
+        send "$password\r"
+        exp_continue
+    }
+    eof
+}
+

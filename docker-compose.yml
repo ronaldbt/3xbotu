@@ -4,19 +4,19 @@ services:
   # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
-    container_name: botu-postgres
+    container_name: botu-3x-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: botu
-      POSTGRES_USER: botu
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-botu_secure_password_2024}
+      POSTGRES_DB: botu_3x
+      POSTGRES_USER: botu_3x
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-botu_3x_secure_password_2024}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_3x_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     networks:
-      - botu-network
+      - botu-3x-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U botu -d botu"]
+      test: ["CMD-SHELL", "pg_isready -U botu_3x -d botu_3x"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -26,11 +26,11 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: botu-backend
+    container_name: botu-3x-backend
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://botu:${POSTGRES_PASSWORD:-botu_secure_password_2024}@postgres:5432/botu
-      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-this-in-production}
+      DATABASE_URL: postgresql://botu_3x:${POSTGRES_PASSWORD:-botu_3x_secure_password_2024}@postgres:5432/botu_3x
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-this-in-production-3x}
       ENVIRONMENT: production
     volumes:
       - ./backend:/app
@@ -38,39 +38,39 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - botu-network
+      - botu-3x-network
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.backend.rule=Host(`api.botut.net`) || Host(`localhost`)"
-      - "traefik.http.routers.backend.entrypoints=web,websecure"
-      - "traefik.http.routers.backend.tls=true"
-      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+      - "traefik.http.routers.backend-3x.rule=Host(`3xapi.botut.net`) || Host(`localhost`)"
+      - "traefik.http.routers.backend-3x.entrypoints=web,websecure"
+      - "traefik.http.routers.backend-3x.tls=true"
+      - "traefik.http.services.backend-3x.loadbalancer.server.port=8000"
 
   # Frontend
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: botu-frontend
+    container_name: botu-3x-frontend
     restart: unless-stopped
     ports:
-      - "3000:80"  # Exponer temporalmente para acceso directo
+      - "3001:80"  # Puerto diferente para evitar conflictos
     depends_on:
       - backend
     networks:
-      - botu-network
+      - botu-3x-network
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.frontend.rule=Host(`botut.net`) || Host(`www.botut.net`)"
-      - "traefik.http.routers.frontend.entrypoints=websecure"
-      - "traefik.http.routers.frontend.tls=true"
-      - "traefik.http.services.frontend.loadbalancer.server.port=80"
-      - "traefik.docker.network=botu_botu-network"
+      - "traefik.http.routers.frontend-3x.rule=Host(`3x.botut.net`) || Host(`www.3x.botut.net`)"
+      - "traefik.http.routers.frontend-3x.entrypoints=websecure"
+      - "traefik.http.routers.frontend-3x.tls=true"
+      - "traefik.http.services.frontend-3x.loadbalancer.server.port=80"
+      - "traefik.docker.network=botu-3x_botu-3x-network"
 
   # Traefik Reverse Proxy
   traefik:
     image: traefik:v3.0
-    container_name: botu-traefik
+    container_name: botu-3x-traefik
     restart: unless-stopped
     command:
       - "--configfile=/etc/traefik/traefik.yml"
@@ -82,16 +82,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik.yml:/etc/traefik/traefik.yml:ro
       - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
-      - traefik_data:/letsencrypt
+      - traefik_3x_data:/letsencrypt
     networks:
-      - botu-network
+      - botu-3x-network
 
 volumes:
-  postgres_data:
+  postgres_3x_data:
     driver: local
-  traefik_data:
+  traefik_3x_data:
     driver: local
 
 networks:
-  botu-network:
+  botu-3x-network:
     driver: bridge

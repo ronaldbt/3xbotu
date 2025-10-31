@@ -1,20 +1,28 @@
 -- Script de inicialización para PostgreSQL
 -- Este archivo se ejecuta automáticamente cuando se crea el contenedor de PostgreSQL
 
--- Crear la base de datos si no existe (aunque ya se crea con POSTGRES_DB)
--- CREATE DATABASE IF NOT EXISTS botu;
-
 -- Crear extensiones necesarias
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Configurar timezone
 SET timezone = 'UTC';
 
--- Crear usuario si no existe (aunque ya se crea con POSTGRES_USER)
--- CREATE USER IF NOT EXISTS botu WITH PASSWORD 'botu_secure_password_2024';
+-- Crear usuario vlad con contraseña parol777
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'vlad') THEN
+        CREATE USER vlad WITH PASSWORD 'parol777';
+    END IF;
+END
+$$;
 
--- Otorgar permisos
-GRANT ALL PRIVILEGES ON DATABASE botu TO botu;
+-- Otorgar permisos al usuario vlad
+GRANT ALL PRIVILEGES ON DATABASE botu_3x TO vlad;
+ALTER USER vlad CREATEDB;
+
+-- Otorgar permisos también al usuario por defecto botu_3x
+GRANT ALL PRIVILEGES ON DATABASE botu_3x TO botu_3x;
 
 -- Mensaje de confirmación
-\echo 'Base de datos botu inicializada correctamente'
+\echo 'Base de datos botu_3x inicializada correctamente'
+\echo 'Usuario vlad creado con privilegios completos'

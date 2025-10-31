@@ -91,7 +91,10 @@ else:
         "http://127.0.0.1:5173",
         "https://botut.net",
         "https://www.botut.net",
-        "https://api.botut.net",  # Añadir el dominio de la API
+        "https://api.botut.net",
+        "https://3x.botut.net",
+        "https://www.3x.botut.net",
+        "https://3xapi.botut.net",
     ]
 
 logger.info(f"🌐 CORS configurado para {environment} - Orígenes permitidos: {origins}")
