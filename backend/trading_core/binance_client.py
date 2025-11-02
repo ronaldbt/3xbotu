@@ -12,9 +12,13 @@ from urllib.parse import urlencode
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# URL de la API pública de Binance
+# URL de la API pública de Binance (Spot)
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
 BINANCE_TESTNET_BASE = "https://testnet.binance.vision/api/v3"
+
+# URL de la API de Binance Futures (para apalancamiento 3x)
+BINANCE_FUTURES_API_BASE = "https://fapi.binance.com/fapi/v1"
+BINANCE_FUTURES_TESTNET_BASE = "https://testnet.binancefuture.com/fapi/v1"
 
 def get_spot_client():
     """
@@ -159,11 +163,15 @@ class BinanceClient:
     Cliente autenticado de Binance para operaciones que requieren API keys
     """
     
-    def __init__(self, api_key: str, secret_key: str, testnet: bool = True):
+    def __init__(self, api_key: str, secret_key: str, testnet: bool = False, use_futures: bool = True):
         self.api_key = api_key
         self.secret_key = secret_key
         self.testnet = testnet
-        self.base_url = BINANCE_TESTNET_BASE if testnet else BINANCE_API_BASE
+        self.use_futures = use_futures  # True para Futures, False para Spot
+        if use_futures:
+            self.base_url = BINANCE_FUTURES_TESTNET_BASE if testnet else BINANCE_FUTURES_API_BASE
+        else:
+            self.base_url = BINANCE_TESTNET_BASE if testnet else BINANCE_API_BASE
         
     def _generate_signature(self, params: str) -> str:
         """Genera firma HMAC SHA256 para autenticación"""
@@ -210,7 +218,27 @@ class BinanceClient:
     def get_account_info(self):
         """Obtiene información de la cuenta"""
         try:
-            return self._make_request('GET', 'account', signed=True)
+            if self.use_futures:
+                # Para Futures, usar endpoint v2 que devuelve más información
+                # Necesitamos usar base_url correcto - puede ser v1 o v2
+                if 'fapi/v1' in self.base_url:
+                    # Reemplazar v1 por v2 para account
+                    base_url_v2 = self.base_url.replace('fapi/v1', 'fapi/v2')
+                    endpoint = 'account'
+                    url = f"{base_url_v2}/{endpoint}"
+                else:
+                    endpoint = 'account'
+                    url = f"{self.base_url}/{endpoint}"
+                
+                headers = {'X-MBX-APIKEY': self.api_key}
+                params = {'timestamp': int(time.time() * 1000)}
+                query_string = urlencode(params)
+                params['signature'] = self._generate_signature(query_string)
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                return response.json()
+            else:
+                return self._make_request('GET', 'account', signed=True)
         except Exception as e:
             logger.error(f"Error obteniendo información de cuenta: {e}")
             raise
@@ -232,10 +260,45 @@ class BinanceClient:
             return False, str(e)
     
     def get_balances(self):
-        """Obtiene balances de la cuenta"""
+        """Obtiene balances de la cuenta (compatible con Spot y Futures)"""
         try:
-            account_info = self.get_account_info()
-            return account_info.get('balances', [])
+            if self.use_futures:
+                # Para Futures, obtener información de cuenta
+                account_info = self.get_account_info()
+                # Futures retorna: {"availableBalance": "10.0", "totalWalletBalance": "10.0", "assets": [...]}
+                # Convertir a formato compatible con Spot
+                available_balance = float(account_info.get('availableBalance', 0.0))
+                total_balance = float(account_info.get('totalWalletBalance', 0.0))
+                
+                # Crear formato compatible con Spot
+                balances = []
+                # Agregar USDT disponible
+                if available_balance > 0:
+                    balances.append({
+                        'asset': 'USDT',
+                        'free': str(available_balance),
+                        'locked': str(total_balance - available_balance)
+                    })
+                
+                # Si hay assets adicionales en Futures
+                if 'assets' in account_info:
+                    for asset in account_info['assets']:
+                        asset_name = asset.get('asset', '')
+                        if asset_name and asset_name != 'USDT':
+                            avail = float(asset.get('availableBalance', 0.0))
+                            total = float(asset.get('totalWalletBalance', 0.0))
+                            if total > 0:
+                                balances.append({
+                                    'asset': asset_name,
+                                    'free': str(avail),
+                                    'locked': str(total - avail)
+                                })
+                
+                return balances
+            else:
+                # Spot: formato original
+                account_info = self.get_account_info()
+                return account_info.get('balances', [])
         except Exception as e:
             logger.error(f"Error obteniendo balances: {e}")
             raise
@@ -253,6 +316,11 @@ class BinanceClient:
             dict: {"success": bool, "order": dict, "error": str}
         """
         try:
+            if self.use_futures:
+                # Para Futures, usar place_futures_order
+                result = self.place_futures_order(symbol, side, quantity, order_type="MARKET")
+                return result  # Ya retorna formato {"success": bool, "order": dict, "error": str}
+            
             params = {
                 'symbol': symbol.upper(),
                 'side': side.upper(),
@@ -306,6 +374,24 @@ class BinanceClient:
             for param in required_params:
                 if param not in kwargs:
                     raise ValueError(f"Parámetro requerido faltante: {param}")
+            
+            if self.use_futures:
+                # Para Futures, usar place_futures_order
+                price = kwargs.get('price')
+                result = self.place_futures_order(
+                    symbol=kwargs['symbol'],
+                    side=kwargs['side'],
+                    quantity=float(kwargs['quantity']),
+                    order_type=kwargs['type'],
+                    price=float(price) if price else None,
+                    position_side="LONG"  # Por defecto LONG para compras
+                )
+                # place_futures_order retorna {"success": bool, "order": dict, "error": str}
+                # place_order debe retornar solo el dict de la orden
+                if result.get('success'):
+                    return result.get('order', {})
+                else:
+                    raise Exception(result.get('error', 'Error ejecutando orden Futures'))
             
             params = {
                 'symbol': kwargs['symbol'].upper(),
@@ -361,6 +447,184 @@ class BinanceClient:
             
         except Exception as e:
             error_msg = f"Error cancelando orden {order_id}: {str(e)}"
+            logger.error(f"❌ {error_msg}")
+            
+            return {
+                "success": False,
+                "order": None,
+                "error": error_msg
+            }
+    
+    # ========== MÉTODOS PARA FUTURES API ==========
+    
+    def set_leverage(self, symbol: str, leverage: int = 3):
+        """
+        Configura el leverage para un símbolo en Futures
+        
+        Args:
+            symbol: Par de trading (ej: "BTCUSDT")
+            leverage: Apalancamiento deseado (default: 3)
+            
+        Returns:
+            dict: Respuesta de Binance
+        """
+        try:
+            if not self.use_futures:
+                raise ValueError("set_leverage solo disponible para Futures API")
+            
+            params = {
+                'symbol': symbol.upper(),
+                'leverage': leverage
+            }
+            
+            logger.info(f"⚙️ Configurando leverage {leverage}x para {symbol}")
+            response = self._make_request('POST', 'leverage', params, signed=True)
+            logger.info(f"✅ Leverage {leverage}x configurado para {symbol}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Error configurando leverage para {symbol}: {e}")
+            raise
+    
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
+        """
+        Configura el tipo de margen para un símbolo en Futures
+        
+        Args:
+            symbol: Par de trading (ej: "BTCUSDT")
+            margin_type: "ISOLATED" o "CROSSED" (default: "ISOLATED")
+            
+        Returns:
+            dict: Respuesta de Binance
+        """
+        try:
+            if not self.use_futures:
+                raise ValueError("set_margin_type solo disponible para Futures API")
+            
+            params = {
+                'symbol': symbol.upper(),
+                'marginType': margin_type.upper()
+            }
+            
+            logger.info(f"⚙️ Configurando margin type {margin_type} para {symbol}")
+            response = self._make_request('POST', 'marginType', params, signed=True)
+            logger.info(f"✅ Margin type {margin_type} configurado para {symbol}")
+            return response
+            
+        except Exception as e:
+            # Si ya está configurado, Binance puede devolver error - ignorar
+            error_msg = str(e).lower()
+            if 'no need to change' in error_msg or 'margin type' in error_msg:
+                logger.info(f"ℹ️ Margin type ya está configurado para {symbol}")
+                return {"code": 200, "msg": "No need to change margin type"}
+            logger.error(f"❌ Error configurando margin type para {symbol}: {e}")
+            raise
+    
+    def get_futures_account(self):
+        """
+        Obtiene información de la cuenta de Futures
+        
+        Returns:
+            dict: Información de la cuenta incluyendo balances y posiciones
+        """
+        try:
+            if not self.use_futures:
+                raise ValueError("get_futures_account solo disponible para Futures API")
+            
+            # Para Futures, usar endpoint v2 para account (más información)
+            if 'fapi/v1' in self.base_url:
+                base_url_v2 = self.base_url.replace('fapi/v1', 'fapi/v2')
+                endpoint = 'account'
+                url = f"{base_url_v2}/{endpoint}"
+                headers = {'X-MBX-APIKEY': self.api_key}
+                params = {'timestamp': int(time.time() * 1000)}
+                query_string = urlencode(params)
+                params['signature'] = self._generate_signature(query_string)
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                return response.json()
+            else:
+                # Fallback a v1 si está en otro formato
+                return self._make_request('GET', 'account', signed=True)
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo cuenta de Futures: {e}")
+            raise
+    
+    def get_futures_positions(self, symbol: str = None):
+        """
+        Obtiene posiciones abiertas en Futures
+        
+        Args:
+            symbol: Símbolo específico (opcional). Si None, devuelve todas las posiciones
+            
+        Returns:
+            list: Lista de posiciones
+        """
+        try:
+            if not self.use_futures:
+                raise ValueError("get_futures_positions solo disponible para Futures API")
+            
+            params = {}
+            if symbol:
+                params['symbol'] = symbol.upper()
+            
+            return self._make_request('GET', 'positionRisk', params, signed=True)
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo posiciones de Futures: {e}")
+            raise
+    
+    def place_futures_order(self, symbol: str, side: str, quantity: float, order_type: str = "MARKET", 
+                          price: float = None, position_side: str = "LONG"):
+        """
+        Coloca una orden en Futures (con apalancamiento)
+        
+        Args:
+            symbol: Par de trading (ej: "BTCUSDT")
+            side: "BUY" o "SELL"
+            quantity: Cantidad (en contratos)
+            order_type: "MARKET" o "LIMIT" (default: "MARKET")
+            price: Precio (solo para LIMIT)
+            position_side: "LONG" o "SHORT" (default: "LONG" - solo compras para subir)
+            
+        Returns:
+            dict: Respuesta de Binance con detalles de la orden
+        """
+        try:
+            if not self.use_futures:
+                raise ValueError("place_futures_order solo disponible para Futures API")
+            
+            # Configurar leverage y margin type antes de ordenar
+            self.set_margin_type(symbol, "ISOLATED")
+            self.set_leverage(symbol, 3)
+            
+            params = {
+                'symbol': symbol.upper(),
+                'side': side.upper(),
+                'type': order_type.upper(),
+                'positionSide': position_side.upper(),  # Solo LONG (comprar para subir)
+                'quantity': f"{float(quantity):.8f}".rstrip('0').rstrip('.')
+            }
+            
+            if order_type.upper() == "LIMIT" and price:
+                params['price'] = f"{float(price):.2f}"
+                params['timeInForce'] = "GTC"
+            
+            logger.info(f"🚀 Ejecutando orden Futures {side} {quantity:.8f} {symbol} @ {position_side} (3x leverage)")
+            
+            order_response = self._make_request('POST', 'order', params, signed=True)
+            
+            logger.info(f"✅ Orden Futures ejecutada: {order_response.get('orderId')} - Status: {order_response.get('status')}")
+            
+            return {
+                "success": True,
+                "order": order_response,
+                "error": None
+            }
+            
+        except Exception as e:
+            error_msg = f"Error ejecutando orden Futures {side} {symbol}: {str(e)}"
             logger.error(f"❌ {error_msg}")
             
             return {

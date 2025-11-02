@@ -295,14 +295,36 @@ class AutoTradingExecutor:
                 else:
                     position_size_usdt = api_key_config.max_position_size_usdt
             
-            # Verificar balance de BNB para optimizar comisiones
+            # Verificar balance disponible
             balance = await self._get_balance_from_binance(api_key_config)
-            bnb_balance = balance.get('BNB', 0.0) if balance else 0.0
+            if not balance:
+                logger.error(f"❌ No se pudo obtener balance para usuario {user_id}")
+                return
             
-            if bnb_balance > 0.1:  # Al menos 0.1 BNB para comisiones
-                logger.info(f"✅ [AUTO TRADING] Usuario {user_id} tiene {bnb_balance:.3f} BNB - Comisiones optimizadas")
+            # Verificar si usa Futures
+            use_futures = getattr(api_key_config, 'futures_enabled', True)
+            
+            if use_futures:
+                # En Futures, validar margen disponible para 3x leverage
+                available_margin = balance.get('USDT', 0.0)
+                required_margin = total_investment / 3.0  # Con 3x, necesitas 1/3 como margen
+                if available_margin < required_margin:
+                    logger.warning(f"⚠️ Balance insuficiente para usuario {user_id}: disponible=${available_margin:.2f}, requerido=${required_margin:.2f} (margen para ${total_investment:.2f} @ 3x)")
+                    return
+                logger.info(f"✅ [AUTO TRADING FUTURES] Usuario {user_id} - Margen disponible: ${available_margin:.2f}, Margen requerido: ${required_margin:.2f}")
             else:
-                logger.warning(f"⚠️ [AUTO TRADING] Usuario {user_id} tiene poco BNB ({bnb_balance:.3f}) - Considera agregar más para comisiones más baratas")
+                # Spot: validar balance total
+                available_balance = balance.get('USDT', 0.0)
+                if available_balance < total_investment:
+                    logger.warning(f"⚠️ Balance insuficiente para usuario {user_id}: disponible=${available_balance:.2f}, requerido=${total_investment:.2f}")
+                    return
+                
+                # Verificar balance de BNB para optimizar comisiones (solo Spot)
+                bnb_balance = balance.get('BNB', 0.0)
+                if bnb_balance > 0.1:  # Al menos 0.1 BNB para comisiones
+                    logger.info(f"✅ [AUTO TRADING] Usuario {user_id} tiene {bnb_balance:.3f} BNB - Comisiones optimizadas")
+                else:
+                    logger.warning(f"⚠️ [AUTO TRADING] Usuario {user_id} tiene poco BNB ({bnb_balance:.3f}) - Considera agregar más para comisiones más baratas")
             
             # Calcular reinversión de ganancias si está habilitada
             reinvestment_amount = 0.0
@@ -369,10 +391,19 @@ class AutoTradingExecutor:
                 logger.info(f"💵 [AUTO TRADING MAINNET] Valor: ${quote_usdt:.2f} USDT")
                 logger.info(f"🎯 [AUTO TRADING MAINNET] IMPORTANTE: Esta es una orden REAL con DINERO REAL!")
                 
-                # Ejecutar orden usando quoteOrderQty
-                order_result = await self._execute_binance_order_quote(
-                    api_key, secret_key, symbol, 'BUY', quote_usdt
-                )
+                # Verificar si usa Futures
+                use_futures = getattr(api_key_config, 'futures_enabled', True)
+                
+                if use_futures:
+                    # Futures: calcular quantity manualmente (no tiene quoteOrderQty)
+                    order_result = await self._execute_binance_order_futures(
+                        api_key, secret_key, symbol, 'BUY', quote_usdt, api_key_config
+                    )
+                else:
+                    # Spot: usar quoteOrderQty
+                    order_result = await self._execute_binance_order_quote(
+                        api_key, secret_key, symbol, 'BUY', quote_usdt
+                    )
                 
                 if order_result['success']:
                     binance_order = order_result['order']
@@ -548,24 +579,41 @@ class AutoTradingExecutor:
             if not api_key_config:
                 return
             
-            # Obtener balance real de la crypto disponible (Binance ya maneja las comisiones automáticamente)
-            balance = await self._get_balance_from_binance(api_key_config)
-            if not balance:
-                logger.error(f"❌ No se pudo obtener balance para API key {api_key_config.id}")
-                return
+            # Verificar si usa Futures
+            use_futures = getattr(api_key_config, 'futures_enabled', True)
             
-            # Usar el balance real de la crypto disponible
-            symbol_base = symbol.replace('USDT', '').lower()  # Ej: btc, bnb, eth
-            sell_quantity = balance.get(symbol_base.upper(), 0.0)
-            original_quantity = buy_order.executed_quantity or buy_order.quantity
-            
-            # Verificar balance de BNB para comisiones optimizadas
-            bnb_balance = balance.get('BNB', 0.0)
-            bnb_info = f" (BNB: {bnb_balance:.3f})" if bnb_balance > 0 else " (sin BNB - comisiones estándar)"
+            if use_futures:
+                # En Futures, no hay balance de assets físicos, usar cantidad de la orden de compra
+                sell_quantity = float(buy_order.executed_quantity or buy_order.quantity or 0)
+                if sell_quantity <= 0:
+                    logger.error(f"❌ Cantidad inválida para venta Futures: {sell_quantity}")
+                    return
+            else:
+                # Spot: obtener balance real de la crypto disponible
+                balance = await self._get_balance_from_binance(api_key_config)
+                if not balance:
+                    logger.error(f"❌ No se pudo obtener balance para API key {api_key_config.id}")
+                    return
+                
+                # Usar el balance real de la crypto disponible
+                symbol_base = symbol.replace('USDT', '').lower()  # Ej: btc, bnb, eth
+                sell_quantity = balance.get(symbol_base.upper(), 0.0)
+                original_quantity = buy_order.executed_quantity or buy_order.quantity
+                
+                # Usar la menor entre balance real y cantidad original
+                sell_quantity = float(min(sell_quantity, original_quantity))
             
             # Log de comisión de compra para referencia
             if buy_order.commission and buy_order.commission > 0:
                 logger.info(f"📊 Comisión de compra pagada en {buy_order.commission_asset}: {buy_order.commission:.8f}")
+            
+            # Información adicional según tipo
+            if use_futures:
+                bnb_info = " (Futures - comisiones en USDT)"
+            else:
+                balance = await self._get_balance_from_binance(api_key_config)
+                bnb_balance = balance.get('BNB', 0.0) if balance else 0.0
+                bnb_info = f" (BNB: {bnb_balance:.3f})" if bnb_balance > 0 else " (sin BNB - comisiones estándar)"
             
             # Ajustar cantidad según LOT_SIZE de Binance
             import math
@@ -614,13 +662,16 @@ class AutoTradingExecutor:
                 
                 # Ejecutar orden REAL de venta en MAINNET
                 logger.info(f"🚀 [AUTO TRADING MAINNET] Ejecutando venta REAL usuario {user_id}: {reason}")
-                logger.info(f"💰 [AUTO TRADING MAINNET] Cantidad: {buy_order.executed_quantity:.6f} {symbol}")
+                logger.info(f"💰 [AUTO TRADING MAINNET] Cantidad: {sell_quantity:.6f} {symbol}")
                 logger.info(f"💵 [AUTO TRADING MAINNET] Precio: ${current_price:.2f}")
                 logger.info(f"🎯 [AUTO TRADING MAINNET] IMPORTANTE: Esta es una venta REAL con DINERO REAL!")
                 
-                # Usar la misma función de ejecución que mainnet30m_executor (solo MAINNET)
+                # Verificar si usa Futures
+                use_futures = getattr(api_key_config, 'futures_enabled', True)
+                
+                # Usar la función de ejecución con soporte Futures
                 order_result = await self._execute_binance_order(
-                    api_key, secret_key, symbol, 'SELL', sell_quantity, False  # Siempre mainnet
+                    api_key, secret_key, symbol, 'SELL', sell_quantity, False, api_key_config  # Pasar api_key_config para detectar Futures
                 )
                 
                 if order_result['success']:
@@ -704,23 +755,48 @@ class AutoTradingExecutor:
         except Exception as e:
             logger.error(f"❌ Error ejecutando orden de salida: {e}")
     
-    async def _execute_binance_order(self, api_key: str, secret_key: str, symbol: str, side: str, quantity: float, is_testnet: bool = False):
+    async def _execute_binance_order(self, api_key: str, secret_key: str, symbol: str, side: str, quantity: float, is_testnet: bool = False, api_key_config: TradingApiKey = None):
         """Ejecuta una orden real en Binance MAINNET usando HMAC SHA256 con quantity"""
         try:
-            # Solo usar mainnet - ignorar parámetro is_testnet
-            base_url = "https://api.binance.com"
-            endpoint = "/api/v3/order"
-            url = f"{base_url}{endpoint}"
+            # Verificar si usa Futures
+            use_futures = False
+            if api_key_config:
+                use_futures = getattr(api_key_config, 'futures_enabled', True)
             
-            # Parámetros de la orden
-            params = {
-                'symbol': symbol,
-                'side': side,
-                'type': 'MARKET',
-                'quantity': f"{quantity:.8f}",
-                'recvWindow': 5000,
-                'timestamp': int(time.time() * 1000)
-            }
+            if use_futures:
+                # Futures API
+                base_url = "https://fapi.binance.com"
+                endpoint = "/fapi/v1/order"
+                url = f"{base_url}{endpoint}"
+                
+                # Configurar leverage y margin type antes de ordenar
+                await self._configure_futures_setup(api_key, secret_key, symbol)
+                
+                # Parámetros de la orden Futures
+                params = {
+                    'symbol': symbol,
+                    'side': side.upper(),
+                    'type': 'MARKET',
+                    'quantity': f"{quantity:.8f}".rstrip('0').rstrip('.'),
+                    'positionSide': 'LONG',  # Solo posiciones LONG
+                    'recvWindow': 5000,
+                    'timestamp': int(time.time() * 1000)
+                }
+            else:
+                # Spot API
+                base_url = "https://api.binance.com"
+                endpoint = "/api/v3/order"
+                url = f"{base_url}{endpoint}"
+                
+                # Parámetros de la orden Spot
+                params = {
+                    'symbol': symbol,
+                    'side': side,
+                    'type': 'MARKET',
+                    'quantity': f"{quantity:.8f}",
+                    'recvWindow': 5000,
+                    'timestamp': int(time.time() * 1000)
+                }
             
             # Crear signature HMAC SHA256
             from urllib.parse import urlencode
@@ -729,7 +805,8 @@ class AutoTradingExecutor:
             
             headers = {'X-MBX-APIKEY': api_key}
             
-            logger.info(f"📤 [Binance] POST /order {symbol} {side} MARKET qty={quantity:.8f}")
+            api_type = "Futures" if use_futures else "Spot"
+            logger.info(f"📤 [Binance {api_type}] POST /order {symbol} {side} MARKET qty={quantity:.8f}")
             
             # Enviar orden
             response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
@@ -739,16 +816,16 @@ class AutoTradingExecutor:
             except:
                 data = {'status_code': response.status_code, 'text': response.text}
             
-            logger.info(f"[Binance] POST /order {symbol} {side} qty={quantity:.8f} resp={response.status_code} body={data}")
+            logger.info(f"[Binance {api_type}] POST /order {symbol} {side} qty={quantity:.8f} resp={response.status_code} body={data}")
             data['success'] = True if response.status_code == 200 else False
-            return data
+            return {'success': data['success'], 'order': data if data['success'] else None, 'error': None if data['success'] else str(data.get('msg', 'Unknown error'))}
                 
         except Exception as e:
             logger.error(f"❌ Error ejecutando orden Binance: {e}")
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': str(e), 'order': None}
     
     async def _execute_binance_order_quote(self, api_key: str, secret_key: str, symbol: str, side: str, quote_usdt: float):
-        """Ejecuta una orden en Binance MAINNET usando quoteOrderQty (valor en USDT)"""
+        """Ejecuta una orden en Binance MAINNET usando quoteOrderQty (valor en USDT) - SOLO SPOT"""
         try:
             base_url = "https://api.binance.com"
             endpoint = "/api/v3/order"
@@ -770,7 +847,7 @@ class AutoTradingExecutor:
             
             headers = {'X-MBX-APIKEY': api_key}
             
-            logger.info(f"📤 [Binance] POST /order {symbol} {side} MARKET quoteOrderQty=${quote_usdt:.2f}")
+            logger.info(f"📤 [Binance Spot] POST /order {symbol} {side} MARKET quoteOrderQty=${quote_usdt:.2f}")
             
             # Enviar orden
             response = requests.post(f"{base_url}{endpoint}?{query}&signature={signature}", headers=headers, timeout=15)
@@ -780,13 +857,140 @@ class AutoTradingExecutor:
             except:
                 data = {'status_code': response.status_code, 'text': response.text}
             
-            logger.info(f"[Binance] POST /order {symbol} {side} quote=${quote_usdt:.2f} resp={response.status_code} body={data}")
+            logger.info(f"[Binance Spot] POST /order {symbol} {side} quote=${quote_usdt:.2f} resp={response.status_code} body={data}")
             data['success'] = True if response.status_code == 200 else False
-            return data
+            return {'success': data['success'], 'order': data if data['success'] else None, 'error': None if data['success'] else str(data.get('msg', 'Unknown error'))}
                 
         except Exception as e:
             logger.error(f"❌ Error ejecutando orden Binance: {e}")
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': str(e), 'order': None}
+    
+    async def _execute_binance_order_futures(self, api_key: str, secret_key: str, symbol: str, side: str, quote_usdt: float, api_key_config: TradingApiKey):
+        """Ejecuta una orden en Binance Futures calculando quantity (no tiene quoteOrderQty)"""
+        try:
+            # Obtener precio actual para calcular quantity
+            current_price = await self._get_current_price(symbol)
+            if not current_price or current_price <= 0:
+                raise Exception(f"No se pudo obtener precio para {symbol}")
+            
+            # Calcular quantity: con 3x leverage, la cantidad es la misma (el leverage lo maneja Binance)
+            quantity = quote_usdt / current_price
+            
+            # Configurar leverage y margin type
+            await self._configure_futures_setup(api_key, secret_key, symbol)
+            
+            base_url = "https://fapi.binance.com"
+            endpoint = "/fapi/v1/order"
+            url = f"{base_url}{endpoint}"
+            
+            # Parámetros de la orden Futures
+            params = {
+                'symbol': symbol,
+                'side': side.upper(),
+                'type': 'MARKET',
+                'quantity': f"{quantity:.8f}".rstrip('0').rstrip('.'),
+                'positionSide': 'LONG',  # Solo posiciones LONG
+                'recvWindow': 5000,
+                'timestamp': int(time.time() * 1000)
+            }
+            
+            # Crear signature HMAC SHA256
+            from urllib.parse import urlencode
+            query = urlencode(params)
+            signature = hmac.new(secret_key.encode(), query.encode(), hashlib.sha256).hexdigest()
+            
+            headers = {'X-MBX-APIKEY': api_key}
+            
+            logger.info(f"📤 [Binance Futures] POST /order {symbol} {side} MARKET qty={quantity:.8f} (exposición ${quote_usdt:.2f} @ 3x)")
+            
+            # Enviar orden
+            response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
+            
+            try:
+                data = response.json()
+            except:
+                data = {'status_code': response.status_code, 'text': response.text}
+            
+            logger.info(f"[Binance Futures] POST /order {symbol} {side} qty={quantity:.8f} resp={response.status_code} body={data}")
+            data['success'] = True if response.status_code == 200 else False
+            return {'success': data['success'], 'order': data if data['success'] else None, 'error': None if data['success'] else str(data.get('msg', 'Unknown error'))}
+                
+        except Exception as e:
+            logger.error(f"❌ Error ejecutando orden Binance Futures: {e}")
+            return {'success': False, 'error': str(e), 'order': None}
+    
+    async def _configure_futures_setup(self, api_key: str, secret_key: str, symbol: str):
+        """Configura leverage 3x y margin type ISOLATED antes de ordenar en Futures"""
+        try:
+            base = "https://fapi.binance.com/fapi/v1"
+            from urllib.parse import urlencode
+            
+            # 1. Configurar margin type a ISOLATED
+            try:
+                ts = int(time.time() * 1000)
+                params_margin = {
+                    'symbol': symbol,
+                    'marginType': 'ISOLATED',
+                    'timestamp': ts,
+                    'recvWindow': 5000
+                }
+                query_margin = urlencode(params_margin)
+                signature_margin = hmac.new(secret_key.encode(), query_margin.encode(), hashlib.sha256).hexdigest()
+                headers = { 'X-MBX-APIKEY': api_key }
+                resp_margin = requests.post(f"{base}/marginType", headers=headers, data=f"{query_margin}&signature={signature_margin}", timeout=15)
+                if resp_margin.status_code == 200:
+                    logger.info(f"✅ Margin type ISOLATED configurado para {symbol}")
+                elif 'no need to change' in resp_margin.text.lower():
+                    logger.info(f"ℹ️ Margin type ya está configurado como ISOLATED para {symbol}")
+                else:
+                    logger.warning(f"⚠️ No se pudo configurar margin type (puede que ya esté configurado): {resp_margin.text}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error configurando margin type (puede que ya esté configurado): {e}")
+            
+            # 2. Configurar leverage a 3x
+            try:
+                ts = int(time.time() * 1000)
+                params_leverage = {
+                    'symbol': symbol,
+                    'leverage': 3,
+                    'timestamp': ts,
+                    'recvWindow': 5000
+                }
+                query_leverage = urlencode(params_leverage)
+                signature_leverage = hmac.new(secret_key.encode(), query_leverage.encode(), hashlib.sha256).hexdigest()
+                resp_leverage = requests.post(f"{base}/leverage", headers=headers, data=f"{query_leverage}&signature={signature_leverage}", timeout=15)
+                if resp_leverage.status_code == 200:
+                    logger.info(f"✅ Leverage 3x configurado para {symbol}")
+                else:
+                    logger.warning(f"⚠️ No se pudo configurar leverage: {resp_leverage.text}")
+            except Exception as e:
+                logger.error(f"❌ Error configurando leverage: {e}")
+                raise
+                
+        except Exception as e:
+            logger.error(f"Error configurando Futures setup: {e}")
+            raise
+    
+    async def _get_current_price(self, symbol: str) -> float:
+        """Obtiene el precio actual del símbolo"""
+        try:
+            # Intentar Futures API primero
+            response = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return float(data['price'])
+        except:
+            pass
+        
+        # Fallback a Spot API
+        try:
+            response = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['price'])
+        except Exception as e:
+            logger.error(f"Error obteniendo precio de {symbol}: {e}")
+            raise Exception(f"No se pudo obtener precio de {symbol}")
     
     def _get_step_size_for_symbol(self, symbol: str) -> float:
         """Retorna el step size (LOT_SIZE) según el símbolo"""
@@ -802,6 +1006,7 @@ class AutoTradingExecutor:
     async def _get_balance_from_binance(self, api_key_config: TradingApiKey) -> Optional[Dict]:
         """
         Obtiene balance de la API key desde Binance (incluyendo BNB)
+        Soporta tanto Spot como Futures
         """
         try:
             # Obtener credenciales desencriptadas
@@ -812,23 +1017,51 @@ class AutoTradingExecutor:
 
             import hmac, hashlib, time
             from urllib.parse import urlencode
-            url = "https://api.binance.com/api/v3/account"
-            ts = int(time.time() * 1000)
-            params = { 'timestamp': ts }
-            query = urlencode(params)
-            signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-            headers = { 'X-MBX-APIKEY': key }
-            resp = requests.get(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            balances = { b['asset']: float(b['free']) + float(b['locked']) for b in data.get('balances', []) }
-            return { 
-                'USDT': balances.get('USDT', 0.0), 
-                'BTC': balances.get('BTC', 0.0),
-                'ETH': balances.get('ETH', 0.0),
-                'BNB': balances.get('BNB', 0.0),
-                'SOL': balances.get('SOL', 0.0)
-            }
+            
+            # Verificar si usa Futures
+            use_futures = getattr(api_key_config, 'futures_enabled', True)  # Por defecto True
+            
+            if use_futures:
+                # Futures API
+                url = "https://fapi.binance.com/fapi/v2/account"
+                ts = int(time.time() * 1000)
+                params = { 'timestamp': ts }
+                query = urlencode(params)
+                signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+                headers = { 'X-MBX-APIKEY': key }
+                resp = requests.get(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                # Futures retorna: {"availableBalance": "10.0", "totalWalletBalance": "10.0", ...}
+                available_balance = float(data.get('availableBalance', 0.0))
+                total_balance = float(data.get('totalWalletBalance', 0.0))
+                return { 
+                    'USDT': available_balance,  # Balance disponible para margen
+                    'TOTAL': total_balance,  # Balance total incluyendo posiciones
+                    'BTC': 0.0,  # En Futures no hay assets físicos
+                    'ETH': 0.0,
+                    'BNB': 0.0,
+                    'SOL': 0.0
+                }
+            else:
+                # Spot API
+                url = "https://api.binance.com/api/v3/account"
+                ts = int(time.time() * 1000)
+                params = { 'timestamp': ts }
+                query = urlencode(params)
+                signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+                headers = { 'X-MBX-APIKEY': key }
+                resp = requests.get(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                balances = { b['asset']: float(b['free']) + float(b['locked']) for b in data.get('balances', []) }
+                return { 
+                    'USDT': balances.get('USDT', 0.0), 
+                    'BTC': balances.get('BTC', 0.0),
+                    'ETH': balances.get('ETH', 0.0),
+                    'BNB': balances.get('BNB', 0.0),
+                    'SOL': balances.get('SOL', 0.0)
+                }
             
         except Exception as e:
             logger.error(f"Error obteniendo balance: {e}")

@@ -296,6 +296,11 @@ class TradingApiKey(Base):
     connection_status = Column(String, default='not_tested')  # 'active', 'error', 'not_tested'
     connection_error = Column(String, nullable=True)
     
+    # Configuración para Futures (apalancamiento 3x)
+    futures_enabled = Column(Boolean, default=True)  # True para usar Futures API, False para Spot
+    default_leverage = Column(Integer, default=3)  # Leverage por defecto (3x)
+    default_margin_type = Column(String, default='ISOLATED')  # Tipo de margen preferido: "ISOLATED" o "CROSSED"
+    
     # Relaciones
     user = relationship("User")
 
@@ -341,6 +346,12 @@ class TradingOrder(Base):
     commission = Column(Float, nullable=True)
     commission_asset = Column(String, nullable=True)
     reason = Column(String, nullable=True)  # Razón del trade: 'U_PATTERN', 'TAKE_PROFIT', 'STOP_LOSS', 'MAX_HOLD'
+    
+    # Campos para Futures (apalancamiento 3x)
+    leverage = Column(Integer, default=1)  # Apalancamiento usado (default: 1 = sin leverage, 3 = 3x)
+    margin_type = Column(String, nullable=True)  # "ISOLATED" o "CROSSED"
+    futures_position_id = Column(String, nullable=True)  # ID de posición en Futures
+    initial_margin = Column(Float, nullable=True)  # Margen inicial usado
     
     # Relaciones
     user = relationship("User")

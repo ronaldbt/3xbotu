@@ -254,7 +254,10 @@ def update_trading_order_status(
     executed_quantity: Optional[float] = None,
     commission: Optional[float] = None,
     commission_asset: Optional[str] = None,
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
+    leverage: Optional[int] = None,
+    margin_type: Optional[str] = None,
+    initial_margin: Optional[float] = None
 ) -> Optional[TradingOrder]:
     """Actualiza el estado de una orden de trading"""
     db_order = db.query(TradingOrder).filter(TradingOrder.id == order_id).first()
@@ -274,6 +277,12 @@ def update_trading_order_status(
         db_order.commission_asset = commission_asset
     if reason:
         db_order.reason = reason
+    if leverage is not None:
+        db_order.leverage = leverage
+    if margin_type:
+        db_order.margin_type = margin_type
+    if initial_margin is not None:
+        db_order.initial_margin = initial_margin
     
     if status in ['FILLED', 'PARTIALLY_FILLED']:
         db_order.executed_at = datetime.now()
@@ -470,11 +479,24 @@ def get_user_portfolio_summary(db: Session, user_id: int) -> dict:
                     
                 from trading_core.binance_client import BinanceClient
                 api_key_str, secret_key = credentials
-                client = BinanceClient(api_key_str, secret_key, testnet=api_key.is_testnet)
+                
+                # Usar Futures si está habilitado
+                use_futures = getattr(api_key, 'futures_enabled', True)  # Por defecto True
+                client = BinanceClient(
+                    api_key_str, 
+                    secret_key, 
+                    testnet=api_key.is_testnet,
+                    use_futures=use_futures
+                )
                 
                 success, account_info = client.test_connection()
                 if success and isinstance(account_info, dict):
-                    balances = account_info.get('balances', [])
+                    if use_futures:
+                        # Futures: get_balances ya normaliza el formato
+                        balances = client.get_balances()
+                    else:
+                        # Spot: formato original
+                        balances = account_info.get('balances', [])
                     
                     # Cache simple de precios en USDT para minimizar llamadas
                     price_cache = {}

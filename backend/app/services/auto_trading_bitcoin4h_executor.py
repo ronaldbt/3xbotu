@@ -168,15 +168,19 @@ class AutoTradingBitcoin4hExecutor:
                 # Devolver mensaje explícito para que el scanner lo muestre
                 return { 'success': False, 'msg': 'position_open' }
             
-            # Obtener balance actual
+            # Obtener balance actual (Futures)
             balance = await self._get_balance(api_key)
-            if not balance or balance.get('USDT', 0) < allocated_usdt:
-                logger.warning(f"Balance insuficiente para API key {api_key.id}: {balance}")
-                return {'success': False, 'error': 'Balance insuficiente'}
+            # Con 3x leverage, necesitamos 1/3 del monto asignado como margen
+            required_margin = float(allocated_usdt) / 3.0
+            available_balance = balance.get('USDT', 0.0) if balance else 0.0
             
-            # Monto a invertir en USDT (usaremos quoteOrderQty en MARKET)
+            if not balance or available_balance < required_margin:
+                logger.warning(f"Balance insuficiente para API key {api_key.id}: disponible={available_balance:.2f} USDT, requerido={required_margin:.2f} USDT (margen para {allocated_usdt:.2f} USDT @ 3x)")
+                return {'success': False, 'error': f'Balance insuficiente. Necesitas {required_margin:.2f} USDT para margen (con 3x leverage)'}
+            
+            # Monto a invertir en USDT (exposición total con 3x)
             entry_price = signal['entry_price']
-            quote_usdt = float(allocated_usdt)
+            quote_usdt = float(allocated_usdt)  # Exposición total deseada
             
             # Crear orden en DB (PENDING)
             new_order = create_trading_order(
@@ -243,6 +247,9 @@ class AutoTradingBitcoin4hExecutor:
                     commission = float(fills[0].get('commission', 0.0)) if fills else None
                     commission_asset = fills[0].get('commissionAsset', None) if fills else None
 
+                # Calcular margen inicial usado (con 3x leverage)
+                initial_margin = quote_usdt / 3.0  # Con 3x, necesitas 1/3 del capital
+                
                 update_trading_order_status(
                     db,
                     order_id=new_order.id,
@@ -252,7 +259,10 @@ class AutoTradingBitcoin4hExecutor:
                     executed_quantity=executed_qty,
                     commission=commission,
                     commission_asset=commission_asset,
-                    reason='U_PATTERN_4H'
+                    reason='U_PATTERN_4H',
+                    leverage=3,  # Apalancamiento 3x
+                    margin_type='ISOLATED',  # Tipo de margen
+                    initial_margin=initial_margin  # Margen inicial usado
                 )
                 await self._send_buy_notification(api_key, {
                     'quantity': executed_qty,
@@ -307,7 +317,7 @@ class AutoTradingBitcoin4hExecutor:
     
     async def _get_balance(self, api_key: TradingApiKey) -> Optional[Dict]:
         """
-        Obtiene balance de la API key desde Binance (incluyendo BNB)
+        Obtiene balance de la API key desde Binance Futures
         """
         try:
             # Obtener credenciales desencriptadas
@@ -319,7 +329,8 @@ class AutoTradingBitcoin4hExecutor:
 
             import hmac, hashlib, time
             from urllib.parse import urlencode
-            url = "https://api.binance.com/api/v3/account"
+            # Cambiar a Futures API
+            url = "https://fapi.binance.com/fapi/v2/account"
             ts = int(time.time() * 1000)
             params = { 'timestamp': ts }
             query = urlencode(params)
@@ -328,27 +339,95 @@ class AutoTradingBitcoin4hExecutor:
             resp = requests.get(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            balances = { b['asset']: float(b['free']) + float(b['locked']) for b in data.get('balances', []) }
+            # En Futures, el balance disponible está en availableBalance
+            available_balance = float(data.get('availableBalance', 0.0))
+            total_wallet_balance = float(data.get('totalWalletBalance', 0.0))
             return { 
-                'USDT': balances.get('USDT', 0.0), 
-                'BTC': balances.get('BTC', 0.0),
-                'BNB': balances.get('BNB', 0.0)  # Agregar BNB para comisiones
+                'USDT': available_balance,  # Balance disponible para trading
+                'TOTAL': total_wallet_balance,  # Balance total incluyendo posiciones abiertas
+                'BTC': 0.0,  # No aplica en Futures (se trabaja con contratos)
+                'BNB': 0.0  # No aplica en Futures
             }
             
         except Exception as e:
-            logger.error(f"Error obteniendo balance: {e}")
+            logger.error(f"Error obteniendo balance de Futures: {e}")
             return None
+    
+    async def _configure_leverage_and_margin(self, api_key: TradingApiKey, symbol: str) -> bool:
+        """
+        Configura leverage 3x e ISOLATED margin antes de abrir posición
+        """
+        try:
+            import hmac, hashlib, time
+            from urllib.parse import urlencode
+            
+            db = next(get_db())
+            creds = get_decrypted_api_credentials(db, api_key.id)
+            if not creds:
+                return False
+            key, secret = creds
+            
+            base = "https://fapi.binance.com/fapi/v1"
+            
+            # 1. Configurar margin type a ISOLATED
+            try:
+                ts = int(time.time() * 1000)
+                params_margin = {
+                    'symbol': symbol,
+                    'marginType': 'ISOLATED',
+                    'timestamp': ts,
+                    'recvWindow': 5000
+                }
+                query_margin = urlencode(params_margin)
+                signature_margin = hmac.new(secret.encode(), query_margin.encode(), hashlib.sha256).hexdigest()
+                headers = { 'X-MBX-APIKEY': key }
+                resp_margin = requests.post(f"{base}/marginType", headers=headers, data=f"{query_margin}&signature={signature_margin}", timeout=15)
+                if resp_margin.status_code == 200:
+                    logger.info(f"✅ Margin type ISOLATED configurado para {symbol}")
+                elif 'no need to change' in resp_margin.text.lower():
+                    logger.info(f"ℹ️ Margin type ya está configurado como ISOLATED para {symbol}")
+                else:
+                    logger.warning(f"⚠️ No se pudo configurar margin type (puede que ya esté configurado): {resp_margin.text}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error configurando margin type (puede que ya esté configurado): {e}")
+            
+            # 2. Configurar leverage a 3x
+            try:
+                ts = int(time.time() * 1000)
+                params_leverage = {
+                    'symbol': symbol,
+                    'leverage': 3,
+                    'timestamp': ts,
+                    'recvWindow': 5000
+                }
+                query_leverage = urlencode(params_leverage)
+                signature_leverage = hmac.new(secret.encode(), query_leverage.encode(), hashlib.sha256).hexdigest()
+                resp_leverage = requests.post(f"{base}/leverage", headers=headers, data=f"{query_leverage}&signature={signature_leverage}", timeout=15)
+                if resp_leverage.status_code == 200:
+                    logger.info(f"✅ Leverage 3x configurado para {symbol}")
+                else:
+                    logger.warning(f"⚠️ No se pudo configurar leverage: {resp_leverage.text}")
+            except Exception as e:
+                logger.error(f"❌ Error configurando leverage: {e}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error configurando leverage y margin: {e}")
+            return False
     
     async def _execute_binance_order(self, api_key: TradingApiKey, order_data: Dict) -> Optional[Dict]:
         """
-        Ejecuta orden en Binance
+        Ejecuta orden en Binance Futures (con apalancamiento 3x)
         """
         try:
             import hmac, hashlib, time
             from urllib.parse import urlencode
 
-            base = "https://api.binance.com"
-            endpoint = "/api/v3/order"
+            # Cambiar a Futures API
+            base = "https://fapi.binance.com/fapi/v1"
+            endpoint = "/order"
 
             # Credenciales desencriptadas
             db = next(get_db())
@@ -356,20 +435,29 @@ class AutoTradingBitcoin4hExecutor:
             if not creds:
                 return { 'success': False, 'msg': 'NO_CREDENTIALS' }
             key, secret = creds
+            
+            # Configurar leverage y margin type antes de ordenar
+            await self._configure_leverage_and_margin(api_key, order_data['symbol'])
 
             ts = int(time.time() * 1000)
             params = {
                 'symbol': order_data['symbol'],
                 'side': order_data['side'],
                 'type': order_data['type'],
+                'positionSide': 'LONG',  # Solo posiciones LONG (comprar para subir)
                 'timestamp': ts,
                 'recvWindow': 5000
             }
             if order_data['type'] == 'MARKET':
                 if 'quoteOrderQty' in order_data:
-                    params['quoteOrderQty'] = f"{float(order_data['quoteOrderQty']):.2f}"
+                    # En Futures, no hay quoteOrderQty, calcular cantidad
+                    # Con 3x leverage, si quieres $100 de exposición, necesitas ~$33.33 de margen
+                    # Pero la cantidad sigue siendo la misma (el leverage lo maneja Binance)
+                    price = await self._get_current_price(order_data['symbol'])
+                    quantity = float(order_data['quoteOrderQty']) / price
+                    params['quantity'] = f"{quantity:.8f}".rstrip('0').rstrip('.')
                 elif 'quantity' in order_data:
-                    params['quantity'] = f"{float(order_data['quantity']):.8f}"
+                    params['quantity'] = f"{float(order_data['quantity']):.8f}".rstrip('0').rstrip('.')
 
             query = urlencode(params)
             signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -380,14 +468,34 @@ class AutoTradingBitcoin4hExecutor:
             except Exception:
                 data = { 'status_code': resp.status_code, 'text': resp.text }
 
-            logger.info(f"[Binance] POST /order {params['symbol']} {params['side']} {params['type']} qty={params.get('quantity')} quote={params.get('quoteOrderQty')} resp={resp.status_code} body={data}")
+            logger.info(f"[Binance Futures] POST /order {params['symbol']} {params['side']} {params['type']} @ LONG (3x) qty={params.get('quantity')} resp={resp.status_code} body={data}")
             # Normalizar bandera success
             data['success'] = True if resp.status_code == 200 else False
             return data
             
         except Exception as e:
-            logger.error(f"Error ejecutando orden en Binance: {e}")
+            logger.error(f"Error ejecutando orden en Binance Futures: {e}")
             return {'success': False, 'error': str(e)}
+    
+    async def _get_current_price(self, symbol: str) -> float:
+        """
+        Obtiene el precio actual del símbolo
+        """
+        try:
+            response = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['price'])
+        except Exception as e:
+            logger.error(f"Error obteniendo precio de {symbol}: {e}")
+            # Fallback a Spot API
+            try:
+                response = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
+                response.raise_for_status()
+                data = response.json()
+                return float(data['price'])
+            except:
+                raise Exception(f"No se pudo obtener precio de {symbol}")
     
     async def _send_buy_notification(self, api_key: TradingApiKey, order_data: Dict, binance_result: Dict):
         """
@@ -1056,8 +1164,6 @@ class AutoTradingBitcoin4hExecutor:
                 
             from urllib.parse import urlencode
             import hmac, hashlib, time
-            base = "https://api.binance.com"
-            endpoint = "/api/v3/myTrades"
             
             for api_key in api_keys:
                 try:
@@ -1065,6 +1171,18 @@ class AutoTradingBitcoin4hExecutor:
                     if not creds:
                         continue
                     key, secret = creds
+                    
+                    # Verificar si usa Futures
+                    use_futures = getattr(api_key, 'futures_enabled', True)
+                    
+                    if use_futures:
+                        # Futures API
+                        base = "https://fapi.binance.com"
+                        endpoint = "/fapi/v1/userTrades"
+                    else:
+                        # Spot API
+                        base = "https://api.binance.com"
+                        endpoint = "/api/v3/myTrades"
                     
                     # Consultar últimas 200 trades de BTCUSDT
                     ts = int(time.time() * 1000)
@@ -1111,9 +1229,19 @@ class AutoTradingBitcoin4hExecutor:
                         
                         for t in trades:
                             try:
-                                if (t.get('isBuyer') is False and 
+                                # Futures usa 'buyer' en vez de 'isBuyer', y 'time' puede estar en diferentes campos
+                                if use_futures:
+                                    # Futures: buscar trades de venta (buyer=False significa venta en Futures)
+                                    is_buy = t.get('buyer', True)  # En Futures, buyer=True es compra
+                                    trade_time = int(t.get('time', t.get('timestamp', 0)))
+                                else:
+                                    # Spot: formato original
+                                    is_buy = t.get('isBuyer', True)
+                                    trade_time = int(t.get('time', 0))
+                                
+                                if (is_buy is False and 
                                     t.get('symbol') == 'BTCUSDT' and 
-                                    int(t.get('time',0)) > buy_time_ms):
+                                    trade_time > buy_time_ms):
                                     matching_sell_trade = t
                                     break
                             except Exception:
@@ -1121,7 +1249,8 @@ class AutoTradingBitcoin4hExecutor:
                         
                         if matching_sell_trade:
                             # Crear orden SELL en la DB
-                            sell_qty = float(matching_sell_trade.get('qty', 0.0))
+                            # Futures usa 'qty', Spot usa 'qty' también, pero verificar ambos
+                            sell_qty = float(matching_sell_trade.get('qty', matching_sell_trade.get('quantity', 0.0)))
                             sell_price = float(matching_sell_trade.get('price', 0.0))
                             
                             from app.schemas.trading_schema import TradingOrderCreate

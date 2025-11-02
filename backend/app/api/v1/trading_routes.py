@@ -470,12 +470,88 @@ async def get_account_balances(
         
         api_key, secret_key = credentials
         
-        # Crear cliente y obtener balances
-        client = BinanceClient(api_key, secret_key, testnet=api_key_config.is_testnet)
+        # Crear cliente y obtener balances (usar Futures si está habilitado)
+        use_futures = getattr(api_key_config, 'futures_enabled', True)  # Por defecto True
+        client = BinanceClient(
+            api_key, 
+            secret_key, 
+            testnet=api_key_config.is_testnet,
+            use_futures=use_futures
+        )
         
         # Obtener balances actuales en tiempo real
         try:
             balances = client.get_balances()
+            
+            # Si es Futures, obtener información adicional
+            futures_info = None
+            if use_futures:
+                try:
+                    # Obtener información completa de la cuenta Futures
+                    account_info = client.get_futures_account()
+                    
+                    # Obtener posiciones abiertas
+                    positions = client.get_futures_positions()
+                    open_positions = []
+                    total_unrealized_pnl = 0.0
+                    total_exposure = 0.0
+                    total_margin_used = 0.0
+                    
+                    for pos in positions:
+                        position_amt = float(pos.get('positionAmt', 0))
+                        if position_amt != 0:  # Solo posiciones con cantidad != 0
+                            entry_price = float(pos.get('entryPrice', 0))
+                            mark_price = float(pos.get('markPrice', 0))
+                            leverage = int(pos.get('leverage', 3))
+                            isolated_margin = float(pos.get('isolatedMargin', 0))
+                            unrealized_pnl = float(pos.get('unRealizedProfit', 0))
+                            
+                            # Calcular exposición total (cantidad * precio mark)
+                            # La exposición es el valor de la posición, el leverage solo afecta el margen requerido
+                            exposure = abs(position_amt) * mark_price
+                            
+                            position_data = {
+                                'symbol': pos.get('symbol'),
+                                'side': 'LONG' if position_amt > 0 else 'SHORT',
+                                'quantity': abs(position_amt),
+                                'entry_price': entry_price,
+                                'mark_price': mark_price,
+                                'leverage': leverage,
+                                'margin_used': isolated_margin,
+                                'unrealized_pnl': unrealized_pnl,
+                                'unrealized_pnl_percentage': (unrealized_pnl / (isolated_margin * leverage)) * 100 if isolated_margin > 0 else 0,
+                                'exposure': exposure,
+                                'liquidation_price': float(pos.get('liquidationPrice', 0))
+                            }
+                            
+                            open_positions.append(position_data)
+                            total_unrealized_pnl += unrealized_pnl
+                            total_exposure += exposure
+                            total_margin_used += isolated_margin
+                    
+                    # Información de margen
+                    available_balance = float(account_info.get('availableBalance', 0))
+                    total_wallet_balance = float(account_info.get('totalWalletBalance', 0))
+                    total_margin_balance = float(account_info.get('totalMarginBalance', 0))
+                    
+                    futures_info = {
+                        'available_margin': available_balance,
+                        'total_wallet_balance': total_wallet_balance,
+                        'total_margin_balance': total_margin_balance,
+                        'margin_used': total_margin_used,
+                        'margin_available': available_balance,
+                        'total_exposure': total_exposure,
+                        'total_unrealized_pnl': total_unrealized_pnl,
+                        'positions': open_positions,
+                        'open_positions_count': len(open_positions),
+                        'default_leverage': getattr(api_key_config, 'default_leverage', 3)
+                    }
+                    
+                    logger.info(f"✅ Info Futures obtenida: margen disponible=${available_balance:.2f}, usado=${total_margin_used:.2f}, exposición=${total_exposure:.2f}, PnL=${total_unrealized_pnl:.2f}")
+                except Exception as futures_error:
+                    logger.warning(f"⚠️ Error obteniendo información Futures: {futures_error}")
+                    # Continuar sin información adicional de Futures
+            
         except Exception as e:
             logger.error(f"❌ Error obteniendo balances en tiempo real: {e}")
             return {
@@ -493,14 +569,21 @@ async def get_account_balances(
         
         logger.info(f"✅ Balances obtenidos para usuario {current_user.id}: {len(active_balances)} activos")
         
-        return {
+        response = {
             "success": True,
             "balances": active_balances,
             "total_assets": len(active_balances),
             "testnet": api_key_config.is_testnet,
             "is_active": api_key_config.is_active,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "futures_enabled": use_futures
         }
+        
+        # Agregar información de Futures si está disponible
+        if futures_info:
+            response['futures_info'] = futures_info
+        
+        return response
         
     except HTTPException:
         raise

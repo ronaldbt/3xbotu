@@ -359,7 +359,8 @@ class AutoTradingBnb4hExecutor:
 
             import hmac, hashlib, time
             from urllib.parse import urlencode
-            url = "https://api.binance.com/api/v3/account"
+            # Cambiar a Futures API
+            url = "https://fapi.binance.com/fapi/v2/account"
             ts = int(time.time() * 1000)
             params = { 'timestamp': ts }
             query = urlencode(params)
@@ -368,49 +369,105 @@ class AutoTradingBnb4hExecutor:
             resp = requests.get(f"{url}?{query}&signature={signature}", headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            balances = { b['asset']: float(b['free']) + float(b['locked']) for b in data.get('balances', []) }
+            available_balance = float(data.get('availableBalance', 0.0))
+            total_wallet_balance = float(data.get('totalWalletBalance', 0.0))
             return { 
-                'USDT': balances.get('USDT', 0.0), 
-                'BNB': balances.get('BNB', 0.0),
-                'BTC': balances.get('BTC', 0.0)  # Agregar BTC para referencia
+                'USDT': available_balance,
+                'TOTAL': total_wallet_balance,
+                'BNB': 0.0,
+                'BTC': 0.0
             }
             
         except Exception as e:
-            logger.error(f"Error obteniendo balance: {e}")
+            logger.error(f"Error obteniendo balance de Futures: {e}")
             return None
     
-    async def _execute_binance_order(self, api_key: TradingApiKey, order_data: Dict) -> Optional[Dict]:
-        """
-        Ejecuta orden en Binance
-        """
+    async def _configure_leverage_and_margin(self, api_key: TradingApiKey, symbol: str) -> bool:
+        """Configura leverage 3x e ISOLATED margin antes de abrir posición"""
         try:
             import hmac, hashlib, time
             from urllib.parse import urlencode
-
-            base = "https://api.binance.com"
-            endpoint = "/api/v3/order"
-
-            # Credenciales desencriptadas
+            db = next(get_db())
+            creds = get_decrypted_api_credentials(db, api_key.id)
+            if not creds:
+                return False
+            key, secret = creds
+            base = "https://fapi.binance.com/fapi/v1"
+            try:
+                ts = int(time.time() * 1000)
+                params_margin = {'symbol': symbol, 'marginType': 'ISOLATED', 'timestamp': ts, 'recvWindow': 5000}
+                query_margin = urlencode(params_margin)
+                signature_margin = hmac.new(secret.encode(), query_margin.encode(), hashlib.sha256).hexdigest()
+                headers = { 'X-MBX-APIKEY': key }
+                resp_margin = requests.post(f"{base}/marginType", headers=headers, data=f"{query_margin}&signature={signature_margin}", timeout=15)
+                if resp_margin.status_code == 200:
+                    logger.info(f"✅ Margin type ISOLATED configurado para {symbol}")
+                elif 'no need to change' in resp_margin.text.lower():
+                    logger.info(f"ℹ️ Margin type ya está configurado como ISOLATED para {symbol}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error configurando margin type (puede que ya esté configurado): {e}")
+            try:
+                ts = int(time.time() * 1000)
+                params_leverage = {'symbol': symbol, 'leverage': 3, 'timestamp': ts, 'recvWindow': 5000}
+                query_leverage = urlencode(params_leverage)
+                signature_leverage = hmac.new(secret.encode(), query_leverage.encode(), hashlib.sha256).hexdigest()
+                resp_leverage = requests.post(f"{base}/leverage", headers=headers, data=f"{query_leverage}&signature={signature_leverage}", timeout=15)
+                if resp_leverage.status_code == 200:
+                    logger.info(f"✅ Leverage 3x configurado para {symbol}")
+                else:
+                    logger.warning(f"⚠️ No se pudo configurar leverage: {resp_leverage.text}")
+            except Exception as e:
+                logger.error(f"❌ Error configurando leverage: {e}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error configurando leverage y margin: {e}")
+            return False
+    
+    async def _get_current_price(self, symbol: str) -> float:
+        """Obtiene el precio actual del símbolo"""
+        try:
+            response = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
+            response.raise_for_status()
+            return float(response.json()['price'])
+        except Exception as e:
+            logger.error(f"Error obteniendo precio de {symbol}: {e}")
+            try:
+                response = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
+                response.raise_for_status()
+                return float(response.json()['price'])
+            except:
+                raise Exception(f"No se pudo obtener precio de {symbol}")
+    
+    async def _execute_binance_order(self, api_key: TradingApiKey, order_data: Dict) -> Optional[Dict]:
+        """Ejecuta orden en Binance Futures (con apalancamiento 3x)"""
+        try:
+            import hmac, hashlib, time
+            from urllib.parse import urlencode
+            base = "https://fapi.binance.com/fapi/v1"
+            endpoint = "/order"
             db = next(get_db())
             creds = get_decrypted_api_credentials(db, api_key.id)
             if not creds:
                 return { 'success': False, 'msg': 'NO_CREDENTIALS' }
             key, secret = creds
-
+            await self._configure_leverage_and_margin(api_key, order_data['symbol'])
             ts = int(time.time() * 1000)
             params = {
                 'symbol': order_data['symbol'],
                 'side': order_data['side'],
                 'type': order_data['type'],
+                'positionSide': 'LONG',
                 'timestamp': ts,
                 'recvWindow': 5000
             }
             if order_data['type'] == 'MARKET':
                 if 'quoteOrderQty' in order_data:
-                    params['quoteOrderQty'] = f"{float(order_data['quoteOrderQty']):.2f}"
+                    price = await self._get_current_price(order_data['symbol'])
+                    quantity = float(order_data['quoteOrderQty']) / price
+                    params['quantity'] = f"{quantity:.8f}".rstrip('0').rstrip('.')
                 elif 'quantity' in order_data:
-                    params['quantity'] = f"{float(order_data['quantity']):.8f}"
-
+                    params['quantity'] = f"{float(order_data['quantity']):.8f}".rstrip('0').rstrip('.')
             query = urlencode(params)
             signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
             headers = { 'X-MBX-APIKEY': key }
@@ -419,14 +476,11 @@ class AutoTradingBnb4hExecutor:
                 data = resp.json()
             except Exception:
                 data = { 'status_code': resp.status_code, 'text': resp.text }
-
-            logger.info(f"[Binance] POST /order {params['symbol']} {params['side']} {params['type']} qty={params.get('quantity')} quote={params.get('quoteOrderQty')} resp={resp.status_code} body={data}")
-            # Normalizar bandera success
+            logger.info(f"[Binance Futures] POST /order {params['symbol']} {params['side']} {params['type']} @ LONG (3x) qty={params.get('quantity')} resp={resp.status_code}")
             data['success'] = True if resp.status_code == 200 else False
             return data
-            
         except Exception as e:
-            logger.error(f"Error ejecutando orden en Binance: {e}")
+            logger.error(f"Error ejecutando orden en Binance Futures: {e}")
             return {'success': False, 'error': str(e)}
     
     async def _send_buy_notification(self, api_key: TradingApiKey, order_data: Dict, binance_result: Dict):
