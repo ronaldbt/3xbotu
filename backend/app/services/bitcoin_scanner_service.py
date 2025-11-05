@@ -40,7 +40,7 @@ class BitcoinScannerService:
             "window_size": 120,        # 120 velas ventana análisis (igual que backtest 2023)
             "scan_interval": 60 * 60,   # 1 hora (3600 segundos)
             "symbol": "BTCUSDT",
-            "data_limit": 1000,        # 1000 velas como backtest 2023
+            "data_limit": 120,        # 1000 velas como backtest 2023
             "environment": "mainnet"   # Solo mainnet
         }
         self.last_scan_time = None

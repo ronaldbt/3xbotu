@@ -40,7 +40,7 @@ class BnbScannerService:
             "window_size": 120,        # 120 velas ventana análisis (igual que backtest)
             "scan_interval": 60 * 60,   # 1 hora (3600 segundos)
             "symbol": "BNBUSDT",
-            "data_limit": 1000,        # 1000 velas para análisis completo
+            "data_limit": 120,        # 1000 velas para análisis completo
             "environment": "mainnet"   # Solo mainnet
         }
         self.last_scan_time = None

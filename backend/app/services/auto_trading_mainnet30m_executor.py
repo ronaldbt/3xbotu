@@ -151,30 +151,61 @@ class AutoTradingMainnet30mExecutor:
     async def _execute_buy_for_api_key(self, db: Session, api_key: TradingApiKey, signal: Dict):
         """
         Ejecuta compra para una API key específica - SOLO si no tiene posición abierta
+        Con apalancamiento configurado: si asignas $100 con 3x, se compran $300 de exposición
+        Si asignas $100 con 6x, se compran $600 de exposición
         """
         try:
+            logger.info(f"🔍 [Mainnet30mExecutor] Iniciando compra para API key {api_key.id}")
+            
             # Verificar que tenga asignación de USDT
             allocated_usdt = api_key.btc_30m_mainnet_allocated_usdt or 0
             if allocated_usdt <= 0:
-                logger.warning(f"API key {api_key.id} no tiene USDT asignado para BTC 30m Mainnet")
+                logger.warning(f"❌ API key {api_key.id} no tiene USDT asignado para BTC 30m Mainnet")
                 return {'success': False, 'error': 'No hay USDT asignado'}
+            
+            logger.info(f"💰 [Mainnet30mExecutor] Asignación configurada: ${allocated_usdt:.2f} USDT")
+            
+            # Obtener leverage configurado (default: 3x si no está configurado)
+            leverage = getattr(api_key, 'default_leverage', 3) or 3
+            logger.info(f"⚙️ [Mainnet30mExecutor] Leverage configurado: {leverage}x")
             
             # VERIFICAR SI YA TIENE UNA POSICIÓN ABIERTA
             open_position = self._get_open_position(db, api_key.id)
             if open_position:
-                logger.info(f"API key {api_key.id} ya tiene una posición abierta (ID: {open_position.id}) - Saltando nueva compra")
+                logger.info(f"⏭️ API key {api_key.id} ya tiene una posición abierta (ID: {open_position.id}) - Saltando nueva compra")
                 # Devolver mensaje explícito para que el scanner lo muestre
                 return { 'success': False, 'msg': 'position_open' }
             
-            # Obtener balance actual
+            # Obtener balance actual (Futures)
+            logger.info(f"📊 [Mainnet30mExecutor] Obteniendo balance de Futures para API key {api_key.id}")
             balance = await self._get_balance(api_key)
-            if not balance or balance.get('USDT', 0) < allocated_usdt:
-                logger.warning(f"Balance insuficiente para API key {api_key.id}: {balance}")
-                return {'success': False, 'error': 'Balance insuficiente'}
+            if not balance:
+                logger.error(f"❌ No se pudo obtener balance para API key {api_key.id}")
+                return {'success': False, 'error': 'No se pudo obtener balance'}
             
-            # Monto a invertir en USDT (usaremos quoteOrderQty en MARKET)
+            available_margin = balance.get('USDT', 0.0)
+            total_wallet_balance = balance.get('TOTAL', 0.0)
+            logger.info(f"💰 [Mainnet30mExecutor] Balance disponible: ${available_margin:.2f} USDT | Balance total: ${total_wallet_balance:.2f} USDT")
+            
+            # Validar margen disponible (necesitas el monto asignado como margen)
+            exposure_usdt_expected = float(allocated_usdt) * float(leverage)
+            if available_margin < allocated_usdt:
+                logger.warning(f"⚠️ Balance insuficiente para API key {api_key.id}: disponible=${available_margin:.2f}, requerido=${allocated_usdt:.2f} USDT")
+                logger.warning(f"⚠️ [Mainnet30mExecutor] Con ${allocated_usdt:.2f} USDT de margen, se comprarán ${exposure_usdt_expected:.2f} USDT de exposición ({leverage}x leverage)")
+                return {'success': False, 'error': f'Balance insuficiente. Necesitas ${allocated_usdt:.2f} USDT de margen disponible (para ${exposure_usdt_expected:.2f} USDT de exposición con {leverage}x)'}
+            
+            logger.info(f"✅ [Mainnet30mExecutor] Balance suficiente: ${available_margin:.2f} >= ${allocated_usdt:.2f} USDT")
+            
+            # Calcular exposición con leverage configurado
+            # Si asignas $100 con 3x, se compran $300 de exposición
+            # Si asignas $100 con 6x, se compran $600 de exposición
             entry_price = signal['entry_price']
-            quote_usdt = float(allocated_usdt)
+            exposure_usdt = float(allocated_usdt) * float(leverage)
+            logger.info(f"🎯 [Mainnet30mExecutor] Margen: ${allocated_usdt:.2f} USDT → Exposición: ${exposure_usdt:.2f} USDT ({leverage}x leverage)")
+            logger.info(f"📈 [Mainnet30mExecutor] Precio entrada señal: ${entry_price:.2f}")
+            
+            # Monto a usar para calcular quantity (exposición total con leverage configurado)
+            quote_usdt = exposure_usdt
             
             # Crear orden en DB (PENDING)
             new_order = create_trading_order(
@@ -195,12 +226,19 @@ class AutoTradingMainnet30mExecutor:
             )
             
             # Ejecutar orden en Binance
-            logger.info(f"[Mainnet30mExecutor] Preparando orden BUY (quote): total={quote_usdt:.2f} USDT")
+            logger.info(f"🚀 [Mainnet30mExecutor] Preparando orden BUY Futures:")
+            logger.info(f"   📊 Símbolo: BTCUSDT")
+            logger.info(f"   💰 Margen utilizado: ${allocated_usdt:.2f} USDT")
+            logger.info(f"   🎯 Exposición total: ${quote_usdt:.2f} USDT ({leverage}x leverage)")
+            logger.info(f"   📈 Precio señal: ${entry_price:.2f}")
+            
             binance_result = await self._execute_binance_order(api_key, {
                 'symbol': 'BTCUSDT',
                 'side': 'BUY',
                 'type': 'MARKET',
-                'quoteOrderQty': quote_usdt
+                'quoteOrderQty': quote_usdt,  # Exposición total con leverage configurado
+                'allocated_margin': allocated_usdt,  # Margen utilizado
+                'leverage': leverage  # Leverage configurado
             })
             
             if binance_result and binance_result.get('success'):
@@ -208,6 +246,11 @@ class AutoTradingMainnet30mExecutor:
                 order_id = str(binance_result.get('orderId')) if binance_result.get('orderId') else None
                 executed_qty = float(binance_result.get('executedQty', 0.0))
                 fills = binance_result.get('fills', [])
+                
+                logger.info(f"✅ [Mainnet30mExecutor] Orden ejecutada exitosamente:")
+                logger.info(f"   🆔 Binance Order ID: {order_id}")
+                logger.info(f"   📊 Quantity ejecutado: {executed_qty:.8f} BTC")
+                logger.info(f"   📈 Fills: {len(fills)}")
                 
                 # Calcular precio promedio ponderado para órdenes con múltiples fills
                 if len(fills) > 1:
@@ -289,18 +332,37 @@ class AutoTradingMainnet30mExecutor:
                 }
                 
             else:
-                update_trading_order_status(db, order_id=new_order.id, status=binance_result.get('status','REJECTED'), reason=binance_result.get('msg','BINANCE_ORDER_FAILED'))
-                logger.error(f"❌ Error ejecutando orden en Binance para API key {api_key.id}: {binance_result}")
+                # Error en la orden
+                error_code = binance_result.get('code', 'N/A')
+                error_msg = binance_result.get('msg', 'Error desconocido')
+                error_detail = binance_result.get('error', error_msg)
+                
+                logger.error(f"❌ [Mainnet30mExecutor] Error ejecutando orden en Binance para API key {api_key.id}")
+                logger.error(f"   🔴 Código de error: {error_code}")
+                logger.error(f"   🔴 Mensaje: {error_msg}")
+                logger.error(f"   🔴 Detalle: {error_detail}")
+                logger.error(f"   🔴 Respuesta completa: {binance_result}")
+                
+                update_trading_order_status(db, order_id=new_order.id, status=binance_result.get('status','REJECTED'), reason=f"[{error_code}] {error_msg}")
                 return {
                     'success': False,
-                    'error': binance_result.get('msg', 'Error ejecutando orden en Binance')
+                    'error': f'Error ejecutando orden en Binance: [{error_code}] {error_msg}',
+                    'error_code': error_code,
+                    'error_detail': error_detail
                 }
                 
         except Exception as e:
-            logger.error(f"Error en _execute_buy_for_api_key: {e}")
+            import traceback
+            logger.error(f"❌ [Mainnet30mExecutor] Error en _execute_buy_for_api_key para API key {api_key.id}: {e}")
+            logger.error(f"   🔴 Tipo de error: {type(e).__name__}")
+            logger.error(f"   🔴 Traceback completo:")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.error(f"      {line}")
             return {
                 'success': False,
-                'error': str(e)
+                'error': f'Error ejecutando compra: {str(e)}',
+                'error_type': type(e).__name__
             }
     
     async def _get_balance(self, api_key: TradingApiKey) -> Optional[Dict]:
@@ -339,66 +401,129 @@ class AutoTradingMainnet30mExecutor:
             logger.error(f"Error obteniendo balance de Futures: {e}")
             return None
     
-    async def _configure_leverage_and_margin(self, api_key: TradingApiKey, symbol: str) -> bool:
-        """Configura leverage 3x e ISOLATED margin antes de abrir posición"""
+    async def _configure_leverage_and_margin(self, api_key: TradingApiKey, symbol: str, leverage: int = None) -> bool:
+        """
+        Configura leverage y ISOLATED margin antes de abrir posición
+        
+        Args:
+            api_key: TradingApiKey con la configuración
+            symbol: Símbolo de trading
+            leverage: Leverage a configurar (si no se proporciona, usa default_leverage de api_key)
+        """
         try:
+            # Obtener leverage (del parámetro o de la configuración)
+            if leverage is None:
+                leverage = getattr(api_key, 'default_leverage', 3) or 3
+            
+            logger.info(f"⚙️ [Mainnet30mExecutor] Configurando leverage {leverage}x y margin ISOLATED para {symbol}")
             import hmac, hashlib, time
             from urllib.parse import urlencode
             db = next(get_db())
             creds = get_decrypted_api_credentials(db, api_key.id)
             if not creds:
+                logger.error(f"❌ No se pudieron obtener credenciales para API key {api_key.id}")
                 return False
             key, secret = creds
             base = "https://fapi.binance.com/fapi/v1"
+            headers = { 'X-MBX-APIKEY': key }
+            
+            # 1. Configurar margin type a ISOLATED
+            margin_configured = False
             try:
                 ts = int(time.time() * 1000)
                 params_margin = {'symbol': symbol, 'marginType': 'ISOLATED', 'timestamp': ts, 'recvWindow': 5000}
                 query_margin = urlencode(params_margin)
                 signature_margin = hmac.new(secret.encode(), query_margin.encode(), hashlib.sha256).hexdigest()
-                headers = { 'X-MBX-APIKEY': key }
                 resp_margin = requests.post(f"{base}/marginType", headers=headers, data=f"{query_margin}&signature={signature_margin}", timeout=15)
+                
                 if resp_margin.status_code == 200:
-                    logger.info(f"✅ Margin type ISOLATED configurado para {symbol}")
+                    logger.info(f"✅ [Mainnet30mExecutor] Margin type ISOLATED configurado para {symbol}")
+                    margin_configured = True
                 elif 'no need to change' in resp_margin.text.lower():
-                    logger.info(f"ℹ️ Margin type ya está configurado como ISOLATED para {symbol}")
+                    logger.info(f"ℹ️ [Mainnet30mExecutor] Margin type ya está configurado como ISOLATED para {symbol}")
+                    margin_configured = True
+                else:
+                    error_text = resp_margin.text
+                    logger.warning(f"⚠️ [Mainnet30mExecutor] No se pudo configurar margin type: {error_text}")
             except Exception as e:
-                logger.warning(f"⚠️ Error configurando margin type (puede que ya esté configurado): {e}")
+                logger.warning(f"⚠️ [Mainnet30mExecutor] Error configurando margin type (puede que ya esté configurado): {e}")
+            
+            # 2. Configurar leverage (dinámico según configuración)
+            leverage_configured = False
             try:
                 ts = int(time.time() * 1000)
-                params_leverage = {'symbol': symbol, 'leverage': 3, 'timestamp': ts, 'recvWindow': 5000}
+                params_leverage = {'symbol': symbol, 'leverage': leverage, 'timestamp': ts, 'recvWindow': 5000}
                 query_leverage = urlencode(params_leverage)
                 signature_leverage = hmac.new(secret.encode(), query_leverage.encode(), hashlib.sha256).hexdigest()
                 resp_leverage = requests.post(f"{base}/leverage", headers=headers, data=f"{query_leverage}&signature={signature_leverage}", timeout=15)
+                
                 if resp_leverage.status_code == 200:
-                    logger.info(f"✅ Leverage 3x configurado para {symbol}")
+                    logger.info(f"✅ [Mainnet30mExecutor] Leverage {leverage}x configurado para {symbol}")
+                    leverage_configured = True
                 else:
-                    logger.warning(f"⚠️ No se pudo configurar leverage: {resp_leverage.text}")
+                    error_text = resp_leverage.text
+                    logger.error(f"❌ [Mainnet30mExecutor] No se pudo configurar leverage {leverage}x: {error_text}")
+                    logger.error(f"   Respuesta completa: {resp_leverage.status_code} - {error_text}")
             except Exception as e:
-                logger.error(f"❌ Error configurando leverage: {e}")
+                logger.error(f"❌ [Mainnet30mExecutor] Error configurando leverage {leverage}x: {e}")
                 return False
+            
+            if not leverage_configured:
+                logger.error(f"❌ [Mainnet30mExecutor] No se pudo configurar leverage {leverage}x para {symbol}")
+                return False
+            
+            logger.info(f"✅ [Mainnet30mExecutor] Configuración completada: Margin={margin_configured}, Leverage={leverage_configured}")
             return True
         except Exception as e:
-            logger.error(f"Error configurando leverage y margin: {e}")
+            logger.error(f"❌ [Mainnet30mExecutor] Error configurando leverage y margin: {e}")
             return False
     
-    async def _get_current_price(self, symbol: str) -> float:
-        """Obtiene el precio actual del símbolo"""
+    async def _get_current_price(self, symbol: str = 'BTCUSDT') -> Optional[float]:
+        """
+        Obtiene el precio actual del símbolo desde Futures API (con fallback a Spot)
+        
+        Args:
+            symbol: Símbolo de trading (default: 'BTCUSDT')
+            
+        Returns:
+            Precio actual del símbolo o None si falla
+        """
         try:
+            logger.info(f"📈 [Mainnet30mExecutor] Obteniendo precio actual de {symbol} desde Futures API...")
             response = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
             response.raise_for_status()
-            return float(response.json()['price'])
+            price_data = response.json()
+            price = float(price_data.get('price', 0))
+            if price <= 0:
+                raise ValueError(f"Precio inválido desde Futures API: {price}")
+            logger.info(f"✅ [Mainnet30mExecutor] Precio obtenido desde Futures: ${price:.2f} para {symbol}")
+            return price
         except Exception as e:
-            logger.error(f"Error obteniendo precio de {symbol}: {e}")
+            logger.warning(f"⚠️ [Mainnet30mExecutor] Error obteniendo precio desde Futures API: {e}")
+            logger.info(f"📈 [Mainnet30mExecutor] Intentando obtener precio desde Spot API...")
             try:
                 response = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
                 response.raise_for_status()
-                return float(response.json()['price'])
-            except:
-                raise Exception(f"No se pudo obtener precio de {symbol}")
+                price_data = response.json()
+                price = float(price_data.get('price', 0))
+                if price <= 0:
+                    raise ValueError(f"Precio inválido desde Spot API: {price}")
+                logger.info(f"✅ [Mainnet30mExecutor] Precio obtenido desde Spot: ${price:.2f} para {symbol}")
+                return price
+            except Exception as e2:
+                logger.error(f"❌ [Mainnet30mExecutor] No se pudo obtener precio desde ninguna API: {e2}")
+                logger.error(f"   🔴 Error Futures: {str(e)}")
+                logger.error(f"   🔴 Error Spot: {str(e2)}")
+                return None
     
     async def _execute_binance_order(self, api_key: TradingApiKey, order_data: Dict) -> Optional[Dict]:
         """Ejecuta orden en Binance Futures (con apalancamiento 3x)"""
         try:
+            logger.info(f"🚀 [Mainnet30mExecutor] Iniciando ejecución de orden en Binance Futures")
+            logger.info(f"   📊 Símbolo: {order_data.get('symbol')}")
+            logger.info(f"   📈 Side: {order_data.get('side')}")
+            logger.info(f"   📋 Type: {order_data.get('type')}")
+            
             import hmac, hashlib, time
             from urllib.parse import urlencode
             base = "https://fapi.binance.com/fapi/v1"
@@ -406,9 +531,18 @@ class AutoTradingMainnet30mExecutor:
             db = next(get_db())
             creds = get_decrypted_api_credentials(db, api_key.id)
             if not creds:
+                logger.error(f"❌ [Mainnet30mExecutor] No se pudieron obtener credenciales para API key {api_key.id}")
                 return { 'success': False, 'msg': 'NO_CREDENTIALS' }
             key, secret = creds
-            await self._configure_leverage_and_margin(api_key, order_data['symbol'])
+            
+            # Configurar leverage y margin ANTES de ordenar
+            leverage = order_data.get('leverage', getattr(api_key, 'default_leverage', 3) or 3)
+            logger.info(f"⚙️ [Mainnet30mExecutor] Configurando leverage {leverage}x y margin ISOLATED...")
+            config_success = await self._configure_leverage_and_margin(api_key, order_data['symbol'], leverage)
+            if not config_success:
+                logger.error(f"❌ [Mainnet30mExecutor] No se pudo configurar leverage/margin, abortando orden")
+                return {'success': False, 'msg': 'Failed to configure leverage/margin', 'code': 'CONFIG_ERROR'}
+            
             ts = int(time.time() * 1000)
             params = {
                 'symbol': order_data['symbol'],
@@ -418,66 +552,92 @@ class AutoTradingMainnet30mExecutor:
                 'timestamp': ts,
                 'recvWindow': 5000
             }
+            
             if order_data['type'] == 'MARKET':
                 if 'quoteOrderQty' in order_data:
+                    # Obtener precio actual para calcular quantity
+                    exposure_usdt = float(order_data['quoteOrderQty'])
+                    allocated_margin = float(order_data.get('allocated_margin', exposure_usdt / 3.0))
+                    
+                    logger.info(f"💰 [Mainnet30mExecutor] Calculando quantity:")
+                    logger.info(f"   💵 Exposición deseada: ${exposure_usdt:.2f} USDT")
+                    logger.info(f"   💰 Margen utilizado: ${allocated_margin:.2f} USDT")
+                    
                     price = await self._get_current_price(order_data['symbol'])
-                    quantity = float(order_data['quoteOrderQty']) / price
+                    if not price or price <= 0:
+                        logger.error(f"❌ [Mainnet30mExecutor] Precio inválido para {order_data['symbol']}: {price}")
+                        return {'success': False, 'msg': f'Precio inválido: {price}', 'code': 'INVALID_PRICE'}
+                    
+                    logger.info(f"   📈 Precio actual: ${price:.2f}")
+                    
+                    quantity = exposure_usdt / price
+                    if quantity <= 0:
+                        logger.error(f"❌ [Mainnet30mExecutor] Quantity calculado inválido: {quantity} (exposure=${exposure_usdt:.2f}, price=${price:.2f})")
+                        return {'success': False, 'msg': f'Quantity inválido: {quantity}', 'code': 'INVALID_QUANTITY'}
+                    
+                    logger.info(f"   📊 Quantity calculado: {quantity:.8f} BTC")
                     params['quantity'] = f"{quantity:.8f}".rstrip('0').rstrip('.')
                 elif 'quantity' in order_data:
-                    params['quantity'] = f"{float(order_data['quantity']):.8f}".rstrip('0').rstrip('.')
-            query = urlencode(params)
-            signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-            headers = { 'X-MBX-APIKEY': key }
-            resp = requests.post(f"{base}{endpoint}", headers=headers, data=f"{query}&signature={signature}", timeout=15)
-            try:
-                data = resp.json()
-            except Exception:
-                data = { 'status_code': resp.status_code, 'text': resp.text }
-            logger.info(f"[Binance Futures] POST /order {params['symbol']} {params['side']} {params['type']} @ LONG (3x) qty={params.get('quantity')} resp={resp.status_code}")
-            data['success'] = True if resp.status_code == 200 else False
-            return data
-        except Exception as e:
-            logger.error(f"Error ejecutando orden en Binance Futures: {e}")
-            return {'success': False, 'error': str(e)}
-
-            # Credenciales desencriptadas
-            db = next(get_db())
-            creds = get_decrypted_api_credentials(db, api_key.id)
-            if not creds:
-                return { 'success': False, 'msg': 'NO_CREDENTIALS' }
-            key, secret = creds
-
-            ts = int(time.time() * 1000)
-            params = {
-                'symbol': order_data['symbol'],
-                'side': order_data['side'],
-                'type': order_data['type'],
-                'timestamp': ts,
-                'recvWindow': 5000
-            }
-            if order_data['type'] == 'MARKET':
-                if 'quoteOrderQty' in order_data:
-                    params['quoteOrderQty'] = f"{float(order_data['quoteOrderQty']):.2f}"
-                elif 'quantity' in order_data:
-                    params['quantity'] = f"{float(order_data['quantity']):.8f}"
-
-            query = urlencode(params)
-            signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-            headers = { 'X-MBX-APIKEY': key }
-            resp = requests.post(f"{base}{endpoint}", headers=headers, data=f"{query}&signature={signature}", timeout=15)
-            try:
-                data = resp.json()
-            except Exception:
-                data = { 'status_code': resp.status_code, 'text': resp.text }
-
-            logger.info(f"[Binance] POST /order {params['symbol']} {params['side']} {params['type']} qty={params.get('quantity')} quote={params.get('quoteOrderQty')} resp={resp.status_code} body={data}")
-            # Normalizar bandera success
-            data['success'] = True if resp.status_code == 200 else False
-            return data
+                    quantity = float(order_data['quantity'])
+                    logger.info(f"   📊 Quantity directo: {quantity:.8f} BTC")
+                    params['quantity'] = f"{quantity:.8f}".rstrip('0').rstrip('.')
             
+            query = urlencode(params)
+            signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+            headers = { 'X-MBX-APIKEY': key }
+            
+            logger.info(f"📤 [Mainnet30mExecutor] Enviando orden a Binance Futures:")
+            logger.info(f"   📊 Parámetros: {params}")
+            logger.info(f"   🔗 URL completa: {base}{endpoint}")
+            logger.info(f"   🔑 Headers: {list(headers.keys())}")
+            logger.info(f"   📝 Query string length: {len(query)} caracteres")
+            logger.info(f"   ⏱️  Timestamp: {ts}")
+            
+            resp = requests.post(f"{base}{endpoint}", headers=headers, data=f"{query}&signature={signature}", timeout=15)
+            logger.info(f"⏱️  [Mainnet30mExecutor] Respuesta recibida en {resp.elapsed.total_seconds():.2f}s")
+            
+            try:
+                data = resp.json()
+            except Exception:
+                data = { 'status_code': resp.status_code, 'text': resp.text }
+            
+            logger.info(f"📥 [Mainnet30mExecutor] Respuesta de Binance Futures:")
+            logger.info(f"   📊 Status Code: {resp.status_code}")
+            logger.info(f"   📋 Response: {data}")
+            
+            if resp.status_code == 200:
+                logger.info(f"✅ [Mainnet30mExecutor] Orden ejecutada exitosamente en Binance Futures")
+                logger.info(f"   🆔 Order ID: {data.get('orderId')}")
+                logger.info(f"   📊 Status: {data.get('status')}")
+                logger.info(f"   📈 Quantity: {data.get('executedQty', 0)}")
+                data['success'] = True
+            else:
+                error_code = data.get('code', 'N/A')
+                error_msg = data.get('msg', 'Unknown error')
+                logger.error(f"❌ [Mainnet30mExecutor] Error en Binance Futures:")
+                logger.error(f"   🔴 Status Code: {resp.status_code}")
+                logger.error(f"   🔴 Error Code: {error_code}")
+                logger.error(f"   🔴 Error Message: {error_msg}")
+                logger.error(f"   🔴 Request URL: {base}{endpoint}")
+                logger.error(f"   🔴 Request Params: {params}")
+                logger.error(f"   🔴 Full Response: {data}")
+                logger.error(f"   🔴 Response Text: {resp.text[:500]}")  # Primeros 500 caracteres
+                data['success'] = False
+                data['code'] = error_code
+                data['msg'] = error_msg
+            
+            return data
         except Exception as e:
-            logger.error(f"Error ejecutando orden en Binance: {e}")
-            return {'success': False, 'error': str(e)}
+            import traceback
+            logger.error(f"❌ [Mainnet30mExecutor] Error ejecutando orden en Binance Futures: {e}")
+            logger.error(f"   🔴 Tipo de error: {type(e).__name__}")
+            logger.error(f"   🔴 Argumentos del error: {e.args}")
+            logger.error(f"   🔴 Traceback completo:")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    logger.error(f"      {line}")
+            logger.error(f"   🔴 Order Data recibido: {order_data}")
+            return {'success': False, 'error': str(e), 'code': 'EXCEPTION', 'error_type': type(e).__name__}
     
     async def _send_buy_notification(self, api_key: TradingApiKey, order_data: Dict, binance_result: Dict):
         """
@@ -593,9 +753,12 @@ class AutoTradingMainnet30mExecutor:
                 return
             
             # Obtener precio actual
-            current_price = await self._get_current_price()
+            logger.info(f"📈 [Mainnet30m] Obteniendo precio actual para verificar posición {buy_order.id}")
+            current_price = await self._get_current_price('BTCUSDT')
             if not current_price:
+                logger.warning(f"⚠️ [Mainnet30m] No se pudo obtener precio para verificar posición {buy_order.id}")
                 return
+            logger.info(f"✅ [Mainnet30m] Precio actual obtenido: ${current_price:.2f} para posición {buy_order.id}")
             
             # Calcular ganancia/pérdida REAL considerando comisiones
             entry_price = buy_order.executed_price or buy_order.price
@@ -703,9 +866,12 @@ class AutoTradingMainnet30mExecutor:
                 return
             
             # Obtener precio actual
-            current_price = await self._get_current_price()
+            logger.info(f"📈 [Mainnet30m] Obteniendo precio actual para verificar grupo {reference_order.binance_order_id}")
+            current_price = await self._get_current_price('BTCUSDT')
             if not current_price:
+                logger.warning(f"⚠️ [Mainnet30m] No se pudo obtener precio para verificar grupo {reference_order.binance_order_id}")
                 return
+            logger.info(f"✅ [Mainnet30m] Precio actual obtenido: ${current_price:.2f} para grupo {reference_order.binance_order_id}")
             
             # Calcular totales del grupo
             total_quantity = 0
@@ -1232,23 +1398,6 @@ class AutoTradingMainnet30mExecutor:
         except Exception as e:
             logger.error(f"[Reconcile] Error general: {e}")
     
-    async def _get_current_price(self) -> Optional[float]:
-        """
-        Obtiene precio actual de BTC
-        """
-        try:
-            url = "https://api.binance.com/api/v3/ticker/price"
-            params = {'symbol': 'BTCUSDT'}
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            return float(data['price'])
-            
-        except Exception as e:
-            logger.error(f"Error obteniendo precio actual: {e}")
-            return None
     
     async def _send_sell_notification(self, api_key: TradingApiKey, buy_order: TradingOrder, sell_order_data: Dict, profit_pct: float, reason: str, pnl_usdt: float = None):
         """
