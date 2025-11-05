@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 import requests
 from sqlalchemy.orm import Session
+from app.utils.binance_futures_info import parse_symbol_filters
 
 from app.db.database import get_db
 from app.db.models import TradingApiKey, TradingOrder
@@ -187,24 +188,17 @@ class AutoTradingMainnet30mExecutor:
             total_wallet_balance = balance.get('TOTAL', 0.0)
             logger.info(f"💰 [Mainnet30mExecutor] Balance disponible: ${available_margin:.2f} USDT | Balance total: ${total_wallet_balance:.2f} USDT")
             
-            # Validar margen disponible (necesitas el monto asignado como margen)
-            exposure_usdt_expected = float(allocated_usdt) * float(leverage)
-            if available_margin < allocated_usdt:
-                logger.warning(f"⚠️ Balance insuficiente para API key {api_key.id}: disponible=${available_margin:.2f}, requerido=${allocated_usdt:.2f} USDT")
-                logger.warning(f"⚠️ [Mainnet30mExecutor] Con ${allocated_usdt:.2f} USDT de margen, se comprarán ${exposure_usdt_expected:.2f} USDT de exposición ({leverage}x leverage)")
-                return {'success': False, 'error': f'Balance insuficiente. Necesitas ${allocated_usdt:.2f} USDT de margen disponible (para ${exposure_usdt_expected:.2f} USDT de exposición con {leverage}x)'}
-            
-            logger.info(f"✅ [Mainnet30mExecutor] Balance suficiente: ${available_margin:.2f} >= ${allocated_usdt:.2f} USDT")
-            
-            # Calcular exposición con leverage configurado
-            # Si asignas $100 con 3x, se compran $300 de exposición
-            # Si asignas $100 con 6x, se compran $600 de exposición
+            # MODO EXPOSICIÓN: el valor configurado es la exposición deseada en USDT
             entry_price = signal['entry_price']
-            exposure_usdt = float(allocated_usdt) * float(leverage)
-            logger.info(f"🎯 [Mainnet30mExecutor] Margen: ${allocated_usdt:.2f} USDT → Exposición: ${exposure_usdt:.2f} USDT ({leverage}x leverage)")
+            exposure_usdt = float(allocated_usdt)
+            required_margin = float(exposure_usdt) / float(leverage)
+            if available_margin < required_margin:
+                logger.warning(f"⚠️ Balance insuficiente para API key {api_key.id}: disponible=${available_margin:.2f}, requerido=${required_margin:.2f} USDT de margen para exposición ${exposure_usdt:.2f} con {leverage}x")
+                return {'success': False, 'error': f'Balance insuficiente. Necesitas ${required_margin:.2f} USDT de margen (exposición ${exposure_usdt:.2f} con {leverage}x)'}
+            logger.info(f"🎯 [Mainnet30mExecutor] Exposición deseada: ${exposure_usdt:.2f} USDT | Leverage: {leverage}x | Margen requerido: ${required_margin:.2f} USDT")
             logger.info(f"📈 [Mainnet30mExecutor] Precio entrada señal: ${entry_price:.2f}")
             
-            # Monto a usar para calcular quantity (exposición total con leverage configurado)
+            # Monto a usar para calcular quantity (exposición total deseada)
             quote_usdt = exposure_usdt
             
             # Crear orden en DB (PENDING)
@@ -228,16 +222,16 @@ class AutoTradingMainnet30mExecutor:
             # Ejecutar orden en Binance
             logger.info(f"🚀 [Mainnet30mExecutor] Preparando orden BUY Futures:")
             logger.info(f"   📊 Símbolo: BTCUSDT")
-            logger.info(f"   💰 Margen utilizado: ${allocated_usdt:.2f} USDT")
-            logger.info(f"   🎯 Exposición total: ${quote_usdt:.2f} USDT ({leverage}x leverage)")
+            logger.info(f"   💰 Margen a usar: ${required_margin:.2f} USDT")
+            logger.info(f"   🎯 Exposición total: ${quote_usdt:.2f} USDT ({leverage}x)")
             logger.info(f"   📈 Precio señal: ${entry_price:.2f}")
             
             binance_result = await self._execute_binance_order(api_key, {
                 'symbol': 'BTCUSDT',
                 'side': 'BUY',
                 'type': 'MARKET',
-                'quoteOrderQty': quote_usdt,  # Exposición total con leverage configurado
-                'allocated_margin': allocated_usdt,  # Margen utilizado
+                'quoteOrderQty': quote_usdt,  # Exposición deseada en USDT (modo exposición)
+                'allocated_margin': required_margin,  # Margen requerido
                 'leverage': leverage  # Leverage configurado
             })
             
@@ -555,27 +549,53 @@ class AutoTradingMainnet30mExecutor:
             
             if order_data['type'] == 'MARKET':
                 if 'quoteOrderQty' in order_data:
-                    # Obtener precio actual para calcular quantity
+                    # Modo exposición: 'quoteOrderQty' representa exposición deseada en USDT
                     exposure_usdt = float(order_data['quoteOrderQty'])
-                    allocated_margin = float(order_data.get('allocated_margin', exposure_usdt / 3.0))
-                    
-                    logger.info(f"💰 [Mainnet30mExecutor] Calculando quantity:")
-                    logger.info(f"   💵 Exposición deseada: ${exposure_usdt:.2f} USDT")
-                    logger.info(f"   💰 Margen utilizado: ${allocated_margin:.2f} USDT")
-                    
+                    allocated_margin = float(order_data.get('allocated_margin', 0.0))
+                    leverage_used = float(order_data.get('leverage', getattr(api_key, 'default_leverage', 3) or 3))
+
+                    logger.info(f"💰 [Mainnet30mExecutor] Calculando quantity (modo exposición):")
+                    logger.info(f"   🎯 Exposición deseada: ${exposure_usdt:.2f} USDT")
+                    logger.info(f"   ⚙️  Leverage: {leverage_used}x | Margen esperado: ${exposure_usdt / leverage_used:.2f} USDT")
+                    if allocated_margin:
+                        logger.info(f"   💰 Margen a usar (validado previamente): ${allocated_margin:.2f} USDT")
+
                     price = await self._get_current_price(order_data['symbol'])
                     if not price or price <= 0:
                         logger.error(f"❌ [Mainnet30mExecutor] Precio inválido para {order_data['symbol']}: {price}")
                         return {'success': False, 'msg': f'Precio inválido: {price}', 'code': 'INVALID_PRICE'}
-                    
+
                     logger.info(f"   📈 Precio actual: ${price:.2f}")
-                    
-                    quantity = exposure_usdt / price
-                    if quantity <= 0:
-                        logger.error(f"❌ [Mainnet30mExecutor] Quantity calculado inválido: {quantity} (exposure=${exposure_usdt:.2f}, price=${price:.2f})")
-                        return {'success': False, 'msg': f'Quantity inválido: {quantity}', 'code': 'INVALID_QUANTITY'}
-                    
-                    logger.info(f"   📊 Quantity calculado: {quantity:.8f} BTC")
+
+                    # Obtener filtros de símbolo para truncado
+                    filters = parse_symbol_filters(order_data['symbol'])
+                    if not filters:
+                        logger.error(f"❌ [Mainnet30mExecutor] No se pudieron obtener filtros para {order_data['symbol']}")
+                        return {'success': False, 'msg': 'Faltan filtros de símbolo', 'code': 'MISSING_FILTERS'}
+                    step_size = float(filters.get('stepSize', '0.001'))
+                    min_qty = float(filters.get('minQty', '0.0'))
+                    min_notional = float(filters.get('notional', '0.0'))
+
+                    quantity_raw = exposure_usdt / price
+                    # Truncar hacia abajo al múltiplo de stepSize
+                    if step_size <= 0:
+                        logger.error(f"❌ [Mainnet30mExecutor] stepSize inválido: {step_size}")
+                        return {'success': False, 'msg': 'stepSize inválido', 'code': 'INVALID_STEPSIZE'}
+                    steps = int(quantity_raw / step_size)
+                    quantity = steps * step_size
+
+                    logger.info(f"   🧮 Qty bruta: {quantity_raw:.8f} | stepSize={step_size} → qty válida: {quantity:.8f}")
+
+                    notional_value = quantity * price
+                    logger.info(f"   📏 Validaciones: minQty={min_qty}, minNotional=${min_notional:.2f} | notional calculado=${notional_value:.2f}")
+
+                    if quantity <= 0 or quantity < min_qty:
+                        logger.error(f"❌ [Mainnet30mExecutor] Quantity inválida tras truncado: {quantity} (minQty={min_qty})")
+                        return {'success': False, 'msg': 'Cantidad por debajo del mínimo', 'code': 'QTY_BELOW_MIN'}
+                    if min_notional and notional_value < min_notional:
+                        logger.error(f"❌ [Mainnet30mExecutor] Notional ${notional_value:.2f} < mínimo ${min_notional:.2f}")
+                        return {'success': False, 'msg': 'Notional por debajo del mínimo', 'code': 'NOTIONAL_BELOW_MIN'}
+
                     params['quantity'] = f"{quantity:.8f}".rstrip('0').rstrip('.')
                 elif 'quantity' in order_data:
                     quantity = float(order_data['quantity'])
@@ -609,7 +629,11 @@ class AutoTradingMainnet30mExecutor:
                 logger.info(f"✅ [Mainnet30mExecutor] Orden ejecutada exitosamente en Binance Futures")
                 logger.info(f"   🆔 Order ID: {data.get('orderId')}")
                 logger.info(f"   📊 Status: {data.get('status')}")
-                logger.info(f"   📈 Quantity: {data.get('executedQty', 0)}")
+                executed_qty = float(data.get('executedQty', 0) or 0)
+                cumm_quote = float(data.get('cummulativeQuoteQty', 0) or 0)
+                logger.info(f"   📈 Quantity ejecutada: {executed_qty}")
+                if cumm_quote:
+                    logger.info(f"   💵 Valor ejecutado (cummulativeQuoteQty): ${cumm_quote:.2f} USDT")
                 data['success'] = True
             else:
                 error_code = data.get('code', 'N/A')
